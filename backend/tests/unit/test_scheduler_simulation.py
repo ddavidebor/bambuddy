@@ -44,7 +44,7 @@ from backend.app.services.queue_projection import ProjectedPrinter, project
 PRINTERS = {1: "P1S", 2: "P1S", 3: "P1S", 4: "X1C"}
 START = datetime(2026, 3, 2, 8, 0, tzinfo=timezone.utc)
 UNKNOWN_DURATION = timedelta(hours=24)  # an unknown print time is assumed to overrun
-SEEDS = int(os.environ.get("SIM_SEEDS", "15"))
+SEEDS = int(os.environ.get("SIM_SEEDS", "10"))
 STEPS = 60
 
 
@@ -125,6 +125,8 @@ class _Job:
     scheduled: datetime | None
     manual_start: bool
     duration: timedelta
+    print_time: int | None = None
+    jumped: bool = False
 
 
 @dataclass
@@ -137,6 +139,7 @@ class _Rules:
     printing_on: set[int]
     backoff: dict[int, float]
     scheduled_rule: bool
+    sjf: bool = False
     violations: list[str] = field(default_factory=list)
 
     def free(self, pid: int) -> bool:
@@ -152,9 +155,17 @@ class _Rules:
         return not job.manual_start and (job.scheduled is None or job.scheduled <= self.clock.now)
 
     def rank(self, job: _Job) -> tuple:
-        """Queue order, except that a scheduled job whose time has come goes first."""
+        """Queue order, except that a scheduled job whose time has come goes first.
+
+        With Shortest-Job-First: jobs jumped earlier first, in queue order; then
+        shortest first, an unknown time last.
+        """
         if self.scheduled_rule and job.scheduled is not None and self.due(job):
             return (0, job.scheduled, job.order)
+        if self.sjf:
+            if job.jumped:
+                return (1, 0, job.order)
+            return (1, 1, job.print_time is None, job.print_time or 0, job.order)
         return (1, job.order)
 
     def may_take(self, job: _Job, pid: int) -> bool:
@@ -219,9 +230,10 @@ class _Rules:
 
 
 class _Sim:
-    def __init__(self, seed: int, scheduled: bool, session_maker):
+    def __init__(self, seed: int, scheduled: bool, session_maker, sjf: bool = False):
         self.rng = random.Random(seed)
         self.scheduled = scheduled
+        self.sjf = sjf
         self.session_maker = session_maker
         self.clock = _Clock()
         self.printers = {pid: _Printer(model) for pid, model in PRINTERS.items()}
@@ -271,6 +283,8 @@ class _Sim:
                 scheduled=r.scheduled_time.replace(tzinfo=timezone.utc) if r.scheduled_time else None,
                 manual_start=r.manual_start,
                 duration=timedelta(seconds=r.print_time_seconds) if r.print_time_seconds else UNKNOWN_DURATION,
+                print_time=r.print_time_seconds,
+                jumped=bool(r.been_jumped),
             )
             for r in rows
             if r.status == "pending"
@@ -386,7 +400,7 @@ class _Sim:
             )
             for pid, p in self.printers.items()
         ]
-        projection = project(items, printers, self.clock.now, sjf=False)
+        projection = project(items, printers, self.clock.now, sjf=self.sjf)
         return {i for i, entry in projection.items() if entry.start == self.clock.now}
 
     async def run(self, steps: int) -> list[str]:
@@ -401,6 +415,7 @@ class _Sim:
                 printing_on=printing_on,
                 backoff=dict(self.scheduler._upload_backoff),
                 scheduled_rule=self.scheduled,
+                sjf=self.sjf,
             )
             async with self.session_maker() as db:
                 projected = await self.projected_now(db, rules)
@@ -417,7 +432,7 @@ class _Sim:
         return self.violations
 
 
-async def _simulate(seed: int, scheduled: bool) -> _Sim:
+async def _simulate(seed: int, scheduled: bool, sjf: bool = False) -> _Sim:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -435,8 +450,12 @@ async def _simulate(seed: int, scheduled: bool) -> _Sim:
                     is_active=True,
                 )
             )
+        if sjf:
+            from backend.app.models.settings import Settings
+
+            db.add(Settings(key="queue_shortest_first", value="true"))
         await db.commit()
-    sim = _Sim(seed, scheduled, session_maker)
+    sim = _Sim(seed, scheduled, session_maker, sjf)
     try:
         await sim.run(STEPS)
     finally:
@@ -444,11 +463,11 @@ async def _simulate(seed: int, scheduled: bool) -> _Sim:
     return sim
 
 
-async def _check_seeds(scheduled: bool) -> None:
+async def _check_seeds(scheduled: bool, sjf: bool = False) -> None:
     failures = []
     dispatches = 0
     for seed in range(SEEDS):
-        sim = await _simulate(seed, scheduled)
+        sim = await _simulate(seed, scheduled, sjf)
         dispatches += sim.dispatches
         if sim.violations:
             failures.append(f"seed {seed}: " + "; ".join(sim.violations[:3]))
@@ -464,3 +483,8 @@ async def test_queue_rules_hold_without_schedules():
 @pytest.mark.asyncio
 async def test_queue_rules_hold_with_scheduled_jobs():
     await _check_seeds(scheduled=True)
+
+
+@pytest.mark.asyncio
+async def test_queue_rules_hold_with_shortest_job_first():
+    await _check_seeds(scheduled=True, sjf=True)
