@@ -7006,11 +7006,6 @@ export const api = {
    *  last run a batch order could re-queue its plate from (#2960). */
   removeFromQueue: (id: number) =>
     request<{ message: string; deleted: boolean }>(`/queue/${id}`, { method: 'DELETE' }),
-  reorderQueue: (items: { id: number; position: number }[]) =>
-    request<{ message: string }>('/queue/reorder', {
-      method: 'POST',
-      body: JSON.stringify({ items }),
-    }),
   // Move pending items next to another one; the server renumbers the queue.
   moveQueueItems: (itemIds: number[], anchorId: number, placeAfter: boolean) =>
     request<{ message: string }>('/queue/move', {
