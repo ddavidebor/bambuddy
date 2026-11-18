@@ -2396,12 +2396,10 @@ export function QueuePage() {
       movingIds = pendingItems.filter((i) => i.batch_id === batchId).map((i) => i.id);
     } else {
       const draggedId = activeId as number;
+      // Only what is still pending moves: a selected job may have started
+      // since it was ticked, and the server refuses the whole move for it.
       movingIds = selectedItems.includes(draggedId) && selectedItems.length > 1
-        ? selectedItems.slice().sort((a, b) => {
-            const ai = pendingItems.findIndex((i) => i.id === a);
-            const bi = pendingItems.findIndex((i) => i.id === b);
-            return ai - bi;
-          })
+        ? pendingItems.filter((i) => selectedItems.includes(i.id)).map((i) => i.id)
         : [draggedId];
     }
     if (movingIds.length === 0) return;
