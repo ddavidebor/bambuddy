@@ -1160,14 +1160,14 @@ export function PrintModal({
     });
   };
 
-  // Saving an existing job. Only Queue has a manual-start checkbox, so a
-  // scheduled job keeps whatever wait it had: a student's scheduled job waits
-  // for review (#1620), and editing it must not start it.
-  const editManualStart =
-    needsReview ||
-    (scheduleOptions.scheduleType === 'queue'
-      ? scheduleOptions.requireManualStart
-      : scheduleOptions.scheduleType === 'scheduled' && !!queueItem?.manual_start);
+  // Queue and Scheduled both show the manual-start checkbox, so a job waits
+  // for Start exactly when the dialog says it does. A scheduled job awaiting
+  // review (#1620) opens with the box ticked and keeps it unless someone who
+  // may start it unticks it. Keeping the flag while the box was hidden left a
+  // job switched from Queue to Scheduled staged forever past its time.
+  const waitsForManualStart = (options: ScheduleOptions) =>
+    (options.scheduleType === 'queue' || options.scheduleType === 'scheduled') && options.requireManualStart;
+  const editManualStart = needsReview || waitsForManualStart(scheduleOptions);
 
   // `acknowledgedPrinters`: the printers whose filament warning the user
   // answered with "Print Anyway". Only their jobs skip the scheduler's check;
@@ -1491,7 +1491,7 @@ export function PrintModal({
           require_previous_success: scheduleOptions.requirePreviousSuccess,
           auto_off_after: scheduleOptions.autoOffAfter,
           gcode_injection: scheduleOptions.gcodeInjection,
-          manual_start: needsReview || (scheduleOptions.scheduleType === 'queue' && scheduleOptions.requireManualStart),
+          manual_start: needsReview || waitsForManualStart(scheduleOptions),
           scheduled_time: scheduleOptions.scheduleType === 'scheduled' && scheduleOptions.scheduledTime
             ? new Date(scheduleOptions.scheduledTime).toISOString()
             : undefined,
@@ -1577,7 +1577,7 @@ export function PrintModal({
               require_previous_success: scheduleOptions.requirePreviousSuccess,
               auto_off_after: scheduleOptions.autoOffAfter,
               gcode_injection: scheduleOptions.gcodeInjection,
-              manual_start: needsReview || (scheduleOptions.scheduleType === 'queue' && scheduleOptions.requireManualStart),
+              manual_start: needsReview || waitsForManualStart(scheduleOptions),
               scheduled_time: scheduleOptions.scheduleType === 'scheduled' && scheduleOptions.scheduledTime
                 ? new Date(scheduleOptions.scheduledTime).toISOString()
                 : undefined,
@@ -1756,7 +1756,7 @@ export function PrintModal({
       require_previous_success: scheduleOptions.requirePreviousSuccess,
       auto_off_after: scheduleOptions.autoOffAfter,
       gcode_injection: scheduleOptions.gcodeInjection,
-      manual_start: needsReview || (scheduleOptions.scheduleType === 'queue' && scheduleOptions.requireManualStart),
+      manual_start: needsReview || waitsForManualStart(scheduleOptions),
       // When the user clicks "Print Anyway" on the frontend deficit warning,
       // persist that acknowledgement so the scheduler doesn't immediately
       // re-flag the item on its first dispatch tick (#1698-followup).
@@ -2009,6 +2009,9 @@ export function PrintModal({
     // than letting the API fail with an unexplained 400.
     if (billingEnabled && (loadingCostCenters || selectedCostCenter == null)) return false;
 
+    // A schedule the fields could not turn into a future time.
+    if (scheduleOptions.scheduleType === 'scheduled' && !scheduleOptions.scheduledTime) return false;
+
     // Need valid printer/model selection
     if (assignmentMode === 'printer' && selectedPrinters.length === 0) return false;
     // Both are about the single-model case. A cross-model job has no one target
@@ -2057,6 +2060,8 @@ export function PrintModal({
     billingEnabled,
     loadingCostCenters,
     selectedCostCenter,
+    scheduleOptions.scheduleType,
+    scheduleOptions.scheduledTime,
   ]);
 
   // Quantity only applies for single-printer or model-based assignment (not multi-printer)

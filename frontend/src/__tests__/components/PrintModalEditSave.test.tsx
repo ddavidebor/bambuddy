@@ -22,6 +22,7 @@ vi.mock('../../contexts/ToastContext', async (importOriginal) => {
 });
 
 import { PrintModal } from '../../components/PrintModal';
+import { formatDateInput, getDatePlaceholder } from '../../utils/date';
 
 const queueItem = {
   id: 9, printer_id: 1, archive_id: 1, position: 1, scheduled_time: null, require_previous_success: false,
@@ -32,13 +33,13 @@ const queueItem = {
   printer_name: 'X1 Carbon', print_time_seconds: 3600, batch_id: null, batch_name: null,
 };
 
-function renderModal(onClose = vi.fn(), onSuccess = vi.fn()) {
+function renderModal(onClose = vi.fn(), onSuccess = vi.fn(), item: Record<string, unknown> = queueItem) {
   render(
     <PrintModal
       mode="edit-queue-item"
       archiveId={1}
       archiveName="Edit Print"
-      queueItem={queueItem as never}
+      queueItem={item as never}
       onClose={onClose}
       onSuccess={onSuccess}
     />,
@@ -89,5 +90,62 @@ describe('PrintModal edit-queue-item save', () => {
     expect(mockShowToast).toHaveBeenCalledTimes(1);
     expect(mockShowToast.mock.calls[0][1]).toBe('error');
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('switching a staged job to Schedule saves it to start on its own', async () => {
+    // The manual-start box was hidden under Schedule, but the flag was kept,
+    // so the job sat staged past its time with nothing saying why (#3537).
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.patch('/api/v1/queue/:id', async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ id: 9, status: 'pending' });
+      }),
+    );
+    const user = userEvent.setup();
+    renderModal(vi.fn(), vi.fn(), { ...queueItem, manual_start: true });
+
+    expect(await screen.findByLabelText(/require manual start/i)).toBeChecked();
+    await user.click(screen.getByRole('button', { name: 'Schedule' }));
+    expect(screen.getByLabelText(/require manual start/i)).not.toBeChecked();
+    await user.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(body).not.toBeNull());
+    expect(body!.manual_start).toBe(false);
+    expect(typeof body!.scheduled_time).toBe('string');
+  });
+
+  it('keeps a scheduled job waiting for Start, and shows that it does', async () => {
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.patch('/api/v1/queue/:id', async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ id: 9, status: 'pending' });
+      }),
+    );
+    const user = userEvent.setup();
+    const later = new Date(Date.now() + 3 * 3600 * 1000).toISOString();
+    renderModal(vi.fn(), vi.fn(), { ...queueItem, manual_start: true, scheduled_time: later });
+
+    expect(await screen.findByLabelText(/require manual start/i)).toBeChecked();
+    await user.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(body).not.toBeNull());
+    expect(body!.manual_start).toBe(true);
+  });
+
+  it('will not save a schedule whose time has already passed', async () => {
+    const user = userEvent.setup();
+    const later = new Date(Date.now() + 3 * 3600 * 1000).toISOString();
+    renderModal(vi.fn(), vi.fn(), { ...queueItem, scheduled_time: later });
+
+    const save = await screen.findByRole('button', { name: /save/i });
+    const dateInput = screen.getByPlaceholderText(getDatePlaceholder('system'));
+    // Yesterday: whatever the time field holds, it is in the past.
+    await user.clear(dateInput);
+    await user.type(dateInput, formatDateInput(new Date(Date.now() - 24 * 3600 * 1000), 'system'));
+
+    expect(await screen.findByText('Please enter a valid date and time')).toBeInTheDocument();
+    expect(save).toBeDisabled();
   });
 });

@@ -83,16 +83,17 @@ export function ScheduleOptionsPanel({
     const parsedDate = parseDateInput(newDateValue, dateFormat as DateFormat);
     const parsedTime = parseTimeInput(newTimeValue);
 
-    setIsDateValid(!!parsedDate);
-    setIsTimeValid(!!parsedTime);
-
     if (parsedDate && parsedTime) {
       parsedDate.setHours(parsedTime.hours, parsedTime.minutes, 0, 0);
-      const now = new Date();
-      if (parsedDate > now) {
-        onChange({ ...options, scheduledTime: toDateTimeLocalValue(parsedDate) });
-      }
     }
+    // A time that has already passed is as unusable as one that does not
+    // parse. Both clear the value, which keeps the dialog from submitting: it
+    // used to keep the last good value, so the job was queued for a time the
+    // fields no longer showed.
+    const inFuture = !!parsedDate && !!parsedTime && parsedDate > new Date();
+    setIsDateValid(!!parsedDate);
+    setIsTimeValid(!!parsedTime && (!parsedDate || inFuture));
+    onChange({ ...options, scheduledTime: inFuture ? toDateTimeLocalValue(parsedDate!) : '' });
   };
 
   const handleDateChange = (value: string) => {
@@ -236,8 +237,9 @@ export function ScheduleOptionsPanel({
         </p>
       )}
 
-      {/* Manual start */}
-      {!needsReview && options.scheduleType === 'queue' && (
+      {/* Manual start. Shown for a scheduled job too: one that waits for Start
+          at its time must say so here, or it reads as a job that never runs. */}
+      {!needsReview && (options.scheduleType === 'queue' || options.scheduleType === 'scheduled') && (
         <div className="flex items-center gap-2">
           <input
             type="checkbox"
