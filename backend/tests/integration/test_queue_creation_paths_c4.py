@@ -404,6 +404,18 @@ class TestAPipelineRun:
         notify.assert_awaited_once()
         assert notify.await_args.kwargs["job_name"] == "pipe ×2"
 
+    async def test_its_copies_go_to_the_end_of_the_queue(self, db_session, test_engine, tmp_path, announced):
+        """Not to the front: an unset position was 0, ahead of every job already waiting."""
+        waiting_archive = await _archive(db_session)
+        waiting = PrintQueueItem(archive_id=waiting_archive.id, status="pending", position=1)
+        db_session.add(waiting)
+        await db_session.commit()
+
+        items = await self._run(db_session, test_engine, tmp_path)
+
+        copies = [item for item in items if item.id != waiting.id]
+        assert [item.position for item in copies] == [2, 3]
+
     async def test_the_sliced_file_is_the_runs_owners(self, db_session, test_engine, tmp_path, announced):
         """Also when no one resolves cloud presets: a key without the cloud scope started it."""
         owner = User(username="runowner", password_hash="x", role="user")
