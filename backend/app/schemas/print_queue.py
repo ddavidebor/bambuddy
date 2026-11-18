@@ -251,6 +251,13 @@ class PrintQueueItemResponse(BaseModel):
     preheat_override: Literal["inherit", "on", "off"] = "inherit"
     preheat_chamber_target_override: int | None = None
     status: Literal["pending", "printing", "completed", "failed", "skipped", "cancelled"]
+    # How far the dispatch has got, on a pending or printing row: "uploading"
+    # (file being sent; upload_progress is the percent), "sent" (start command
+    # out, the printer not yet seen to start). None: not being dispatched, or
+    # printing confirmed.
+    dispatch_phase: Literal["uploading", "sent"] | None = None
+    upload_progress: float | None = None
+    sent_at: UTCDatetime = None
     started_at: UTCDatetime
     completed_at: UTCDatetime
     error_message: str | None

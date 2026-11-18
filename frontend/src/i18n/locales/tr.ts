@@ -1609,6 +1609,8 @@ export default {
     status: {
       pending: 'Beklemede',
       waiting: 'Bekliyor',
+      uploading: 'Yükleniyor',
+      sent: 'Gönderildi, yazıcı bekleniyor',
       printing: 'Yazdırılıyor',
       paused: 'Duraklatıldı',
       completed: 'Tamamlandı',

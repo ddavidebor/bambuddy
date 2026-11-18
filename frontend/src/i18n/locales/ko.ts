@@ -1536,6 +1536,8 @@ export default {
     status: {
       pending: '대기 중',
       waiting: '기다리는 중',
+      uploading: '업로드 중',
+      sent: '전송됨, 프린터 대기 중',
       printing: '인쇄 중',
       paused: '일시정지',
       completed: '완료',

@@ -6085,6 +6085,16 @@ async def _run_migrations(conn):
     # on SQLite and Postgres.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN color_substitutions TEXT")
 
+    # Migration: how far a queue item's dispatch has got ("uploading", "sent")
+    # and when it was sent, so the queue shows whether a job reached the printer
+    # and a restart can recover a send whose start was never seen. Nullable, no
+    # default; the timestamp type differs by dialect as for dispatching_at.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN dispatch_phase VARCHAR(16)")
+    if is_sqlite():
+        await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN sent_at DATETIME")
+    else:
+        await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN sent_at TIMESTAMP")
+
     # Migration: spools assigned to a tray while a print runs, so a hand swap
     # splits the print between them across a restart (#3325). Nullable JSON, no
     # default -- identical DDL on SQLite and Postgres.

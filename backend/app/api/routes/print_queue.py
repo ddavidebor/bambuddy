@@ -442,6 +442,18 @@ async def _trusted_item_estimated_cost(
     return max(cost for cost in estimates if cost is not None)
 
 
+def _dispatch_progress(item: PrintQueueItem) -> dict:
+    """The dispatch phase, upload percent and send time a queue row shows."""
+    from backend.app.services.print_scheduler import scheduler
+
+    phase = item.dispatch_phase if item.status in ("pending", "printing") else None
+    return {
+        "dispatch_phase": phase,
+        "upload_progress": scheduler.upload_progress(item.id) if phase == "uploading" else None,
+        "sent_at": item.sent_at if phase == "sent" else None,
+    }
+
+
 def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
     """Add nested archive/printer/library_file info to response."""
     # Parse ams_mapping from JSON string BEFORE model_validate
@@ -515,6 +527,7 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         "required_filament_types": required_filament_types_parsed,
         "filament_overrides": filament_overrides_parsed,
         "waiting_reason": item.waiting_reason,
+        **_dispatch_progress(item),
         "archive_id": item.archive_id,
         "library_file_id": item.library_file_id,
         "cost_center_id": item.cost_center_id,

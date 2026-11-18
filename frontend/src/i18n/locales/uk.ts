@@ -1624,6 +1624,8 @@ export default {
     status: {
       pending: "В очікуванні",
       waiting: "Очікування",
+      uploading: "Завантаження",
+      sent: "Надіслано, очікування принтера",
       printing: "Друк",
       paused: "Призупинено",
       completed: "Виконано",

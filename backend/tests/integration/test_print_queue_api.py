@@ -3933,6 +3933,48 @@ class TestMoveEndpoint:
         assert response.status_code == 422
 
 
+class TestDispatchProgressOnTheQueue:
+    """The queue says whether a job is being sent, sent, or confirmed printing."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_rows_carry_their_dispatch_phase(
+        self, async_client: AsyncClient, db_session, printer_factory, archive_factory
+    ):
+        from unittest.mock import patch
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services import print_scheduler
+
+        printer = await printer_factory()
+        rows = {}
+        for name, status, phase in [
+            ("uploading", "pending", "uploading"),
+            ("sent", "printing", "sent"),
+            ("confirmed", "printing", None),
+            ("done", "completed", "sent"),  # a leftover phase on a finished row means nothing
+        ]:
+            archive = await archive_factory(printer.id, with_run=False)
+            item = PrintQueueItem(printer_id=printer.id, archive_id=archive.id, status=status, dispatch_phase=phase)
+            db_session.add(item)
+            await db_session.flush()
+            rows[name] = item.id
+        await db_session.commit()
+
+        with patch.dict(print_scheduler._upload_progress, {rows["uploading"]: 63.0}):
+            response = await async_client.get("/api/v1/queue/")
+        assert response.status_code == 200
+        by_id = {row["id"]: row for row in response.json()}
+
+        assert (by_id[rows["uploading"]]["dispatch_phase"], by_id[rows["uploading"]]["upload_progress"]) == (
+            "uploading",
+            63.0,
+        )
+        assert by_id[rows["sent"]]["dispatch_phase"] == "sent"
+        assert by_id[rows["confirmed"]]["dispatch_phase"] is None
+        assert by_id[rows["done"]]["dispatch_phase"] is None
+
+
 class TestForceColorOverridesAreScopedToThePlate:
     """Queueing several plates of one 3MF must not make each plate wait on the
     colours of its siblings (#2551).

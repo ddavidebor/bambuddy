@@ -1625,6 +1625,8 @@ export default {
     status: {
       pending: 'Väntande',
       waiting: 'Väntar',
+      uploading: 'Laddar upp',
+      sent: 'Skickad, väntar på skrivaren',
       printing: 'Skriver ut',
       paused: 'Pausad',
       completed: 'Slutförd',

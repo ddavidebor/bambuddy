@@ -65,6 +65,8 @@ import {
   PlayCircle,
   Workflow,
   ThumbsUp,
+  Upload,
+  Send,
 } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import { PipelineRunsView } from './PipelineRunsPage';
@@ -289,7 +291,27 @@ function formatWeight(g: number, useKg = false): string {
   return `${Math.round(g)}g`;
 }
 
-function StatusBadge({ status, waitingReason, printerState, t }: { status: PrintQueueItem['status']; waitingReason?: string | null; printerState?: string | null; t: (key: string) => string }) {
+function StatusBadge({ status, waitingReason, printerState, dispatchPhase, uploadProgress, t }: { status: PrintQueueItem['status']; waitingReason?: string | null; printerState?: string | null; dispatchPhase?: PrintQueueItem['dispatch_phase']; uploadProgress?: number | null; t: (key: string) => string }) {
+  // Being dispatched: whether the job has reached the printer is the one thing
+  // a plain "Pending" or "Printing" cannot say.
+  if (status === 'pending' && dispatchPhase === 'uploading') {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-400/10 border-blue-200 dark:border-blue-400/20">
+        <Upload className="w-3.5 h-3.5" />
+        {t('queue.status.uploading')}
+        {uploadProgress != null && ` ${Math.floor(uploadProgress)}%`}
+      </span>
+    );
+  }
+  if (status === 'printing' && dispatchPhase === 'sent') {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-400/10 border-blue-200 dark:border-blue-400/20">
+        <Send className="w-3.5 h-3.5" />
+        {t('queue.status.sent')}
+      </span>
+    );
+  }
+
   // Special case: pending with waiting_reason shows as "Waiting"
   if (status === 'pending' && waitingReason) {
     return (
@@ -1119,7 +1141,14 @@ function SortableQueueItem({
 
         {/* Status badge + Actions */}
         <div className="flex flex-col sm:flex-row items-end sm:items-center gap-2 sm:gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-          <StatusBadge status={item.status} waitingReason={item.waiting_reason} printerState={printerState} t={t} />
+          <StatusBadge
+            status={item.status}
+            waitingReason={item.waiting_reason}
+            printerState={printerState}
+            dispatchPhase={item.dispatch_phase}
+            uploadProgress={item.upload_progress}
+            t={t}
+          />
 
           <div className="flex items-center gap-0.5 sm:gap-1">
             {isPrinting && (

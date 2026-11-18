@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from fastapi import HTTPException
-from sqlalchemy import delete, false, func, or_, select, true, update
+from sqlalchemy import case, delete, false, func, null, or_, select, true, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -206,6 +206,19 @@ def _remaining_percent(label_weight: int | float | None, weight_used: float | No
 # sub-200 ms files.
 _DISPATCH_PROGRESS_BYTE_STEP = 256 * 1024
 _DISPATCH_PROGRESS_MIN_INTERVAL_SECS = 0.2
+
+# A claim ending leaves "uploading" behind only on a row that never turned
+# "sent": cleared; any later phase stands.
+_PHASE_AFTER_CLAIM = case((PrintQueueItem.dispatch_phase == "uploading", null()), else_=PrintQueueItem.dispatch_phase)
+
+# Latest upload progress per queue item, 0-100, written by _UploadProgressBridge
+# from the FTP thread and read by the queue API. Dropped when the dispatch ends.
+_upload_progress: dict[int, float] = {}
+
+# A sent print the start watchdog has not confirmed after this long is one no
+# watchdog is watching any more (a restart dropped it), and the reconcile sweep
+# takes it over. Longer than the watchdog's two phases together (90 + 180 s).
+UNCONFIRMED_SEND_GRACE_SECONDS = 330.0
 # How far back chamber temperature samples are retained. 2h comfortably spans
 # any soak a user can configure (capped at 30 min) plus the plate-clearing gap
 # before the next print.
@@ -419,6 +432,7 @@ class _UploadProgressBridge:
         self._has_emitted = True
         self._last_emit_bytes = bytes_transferred
         self._last_emit_monotonic = now
+        _upload_progress[self._queue_item_id] = min(100.0, 100.0 * bytes_transferred / total_bytes)
         try:
             asyncio.run_coroutine_threadsafe(
                 ws_manager.send_queue_item_upload_progress(
@@ -1621,6 +1635,9 @@ class PrintScheduler:
         # entry once the print runs, and withdraws what it stands for when the
         # print never starts (see `_forget_unstarted_print`).
         self._sent_unstarted_print: dict[int, tuple[int, str | None, int | None]] = {}
+        # Items whose start watchdog is running. A "sent" row outside this set
+        # has no one watching for its start; see _reconcile_unconfirmed_sends.
+        self._watched_sends: set[int] = set()
         # Chamber temperature history for smart soak-time reduction.
         # printer_id -> deque of (monotonic_timestamp, celsius) sampled each scheduler tick.
         # Entries older than _chamber_history_ttl are pruned on write.
@@ -1693,6 +1710,7 @@ class PrintScheduler:
                 # the next restart.
                 await self._clear_stale_dispatch_claims()
                 await self._close_stranded_printing_items()
+                await self._reconcile_unconfirmed_sends()
                 dispatched = await self.check_queue()
             except Exception as e:
                 logger.error("Scheduler error: %s", e)
@@ -1741,6 +1759,9 @@ class PrintScheduler:
                     select(PrintQueueItem)
                     .where(PrintQueueItem.status == "printing")
                     .where(PrintQueueItem.printer_id.is_not(None))
+                    # A send whose start was never seen is not a print that
+                    # ended: the watchdog or _reconcile_unconfirmed_sends owns it.
+                    .where(or_(PrintQueueItem.dispatch_phase.is_(None), PrintQueueItem.dispatch_phase != "sent"))
                 )
                 items = list(result.scalars().all())
                 if not items:
@@ -1790,6 +1811,102 @@ class PrintScheduler:
             # that can itself break the scheduler loop is worse than the strand.
             logger.error("Stranded-item sweep failed: %s", e)
 
+    def upload_progress(self, item_id: int) -> float | None:
+        """Percent of the item's file uploaded so far, or None if no upload is running."""
+        return _upload_progress.get(item_id)
+
+    async def _watch_send(self, item_id: int, watchdog: Awaitable[None]) -> None:
+        """Run a start watchdog, recording that this item's send is watched."""
+        self._watched_sends.add(item_id)
+        try:
+            await watchdog
+        finally:
+            self._watched_sends.discard(item_id)
+
+    @staticmethod
+    async def _confirm_started(item_id: int) -> None:
+        """The printer started this item's print: it is no longer only "sent"."""
+        try:
+            async with async_session() as db:
+                await db.execute(
+                    update(PrintQueueItem)
+                    .where(PrintQueueItem.id == item_id)
+                    .where(PrintQueueItem.dispatch_phase == "sent")
+                    .values(dispatch_phase=None)
+                )
+                await db.commit()
+        except Exception as e:
+            # Display state: the print runs either way, and the reconcile sweep
+            # confirms it on a later pass.
+            logger.warning("Queue item %s: could not record that its print started: %s", item_id, e)
+
+    async def _reconcile_unconfirmed_sends(self) -> None:
+        """Settle "sent" rows that no start watchdog is watching.
+
+        The watchdog lives in memory, so a restart between the start command and
+        the printer starting left the row "printing" with nothing to tell whether
+        it ever started. The stranded-item sweep then closed it as cancelled once
+        the printer sat idle, so a job that never printed left the queue as if
+        someone had cancelled it. This takes such rows over once the watchdog's
+        own window has passed: printing means it started; idle means it did not,
+        and it goes back to the queue like a watchdog revert, within the same
+        retry budget. A disconnected printer proves nothing and is left for a
+        later pass.
+        """
+        try:
+            async with async_session() as db:
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=UNCONFIRMED_SEND_GRACE_SECONDS)
+                rows = (
+                    await db.execute(
+                        select(PrintQueueItem)
+                        .where(PrintQueueItem.status == "printing")
+                        .where(PrintQueueItem.dispatch_phase == "sent")
+                    )
+                ).scalars()
+                changed = []
+                for item in rows:
+                    sent_at = _aware_utc(item.sent_at)
+                    if item.id in self._watched_sends or sent_at is None or sent_at > cutoff:
+                        continue
+                    state = printer_manager.get_status(item.printer_id) if item.printer_id else None
+                    if state is None or not state.connected:
+                        continue
+                    if state.state in _ACTIVE_PRINT_STATES:
+                        item.dispatch_phase = None
+                    elif state.state in _TERMINAL_STATE_QUEUE_STATUS:
+                        item.dispatch_attempts = (item.dispatch_attempts or 0) + 1
+                        item.dispatch_phase = None
+                        item.sent_at = None
+                        item.started_at = None
+                        if item.dispatch_attempts >= DISPATCH_MAX_ATTEMPTS:
+                            item.status = "failed"
+                            item.completed_at = datetime.now(timezone.utc)
+                            item.error_message = (
+                                f"The printer was sent the job but never started printing, after "
+                                f"{item.dispatch_attempts} attempts. Check the printer's screen and start the job again."
+                            )
+                        else:
+                            item.status = "pending"
+                        self._forget_unstarted_print(item.id, unless_printing=True)
+                        logger.warning(
+                            "Queue item %s: sent to printer %s at %s and never seen to start; %s",
+                            item.id,
+                            item.printer_id,
+                            sent_at.isoformat(),
+                            "failed, out of attempts" if item.status == "failed" else "back in the queue",
+                        )
+                    else:
+                        continue
+                    changed.append(item.id)
+                if changed:
+                    await db.commit()
+                    from backend.app.services.print_batch import refresh_batches_after
+
+                    await refresh_batches_after(changed)
+        except Exception as e:
+            # Best-effort, like the sweeps beside it.
+            logger.error("Unconfirmed-send sweep failed: %s", e)
+
     async def _clear_stale_dispatch_claims(self, *, at_startup: bool = False) -> None:
         """Clear dispatch claims with no live dispatch coroutine behind them (#2615).
 
@@ -1816,7 +1933,9 @@ class PrintScheduler:
         try:
             async with async_session() as db:
                 res = await db.execute(
-                    update(PrintQueueItem).where(PrintQueueItem.dispatching_at.is_not(None)).values(dispatching_at=None)
+                    update(PrintQueueItem)
+                    .where(PrintQueueItem.dispatching_at.is_not(None))
+                    .values(dispatching_at=None, dispatch_phase=_PHASE_AFTER_CLAIM)
                 )
                 await db.commit()
                 if res.rowcount:
@@ -3265,6 +3384,7 @@ class PrintScheduler:
                 # running; drop it so the set cannot grow without bound and a
                 # re-queued item never inherits a stale cancellation.
                 self._cancelled_dispatches.discard(item_id)
+                _upload_progress.pop(item_id, None)
                 # Release the claim on every exit. Once dispatch has finished the
                 # row's status carries the lock (printing/failed/cancelled are all
                 # != pending), so the token is only needed for the duration of the
@@ -3582,7 +3702,7 @@ class PrintScheduler:
         )
         if printer_id is not None:
             query = query.where(PrintQueueItem.printer_id == printer_id)
-        res = await db.execute(query.values(dispatching_at=datetime.now(timezone.utc)))
+        res = await db.execute(query.values(dispatching_at=datetime.now(timezone.utc), dispatch_phase="uploading"))
         await db.commit()
         return res.rowcount > 0
 
@@ -3603,7 +3723,11 @@ class PrintScheduler:
         """
         for attempt in range(1, 4):
             try:
-                await db.execute(update(PrintQueueItem).where(PrintQueueItem.id == item_id).values(dispatching_at=None))
+                await db.execute(
+                    update(PrintQueueItem)
+                    .where(PrintQueueItem.id == item_id)
+                    .values(dispatching_at=None, dispatch_phase=_PHASE_AFTER_CLAIM)
+                )
                 await db.commit()
                 return
             except Exception as exc:
@@ -9857,6 +9981,7 @@ class PrintScheduler:
                     error_message=message,
                     completed_at=datetime.now(timezone.utc),
                     color_substitutions=None,
+                    dispatch_phase=None,
                 )
                 .execution_options(synchronize_session=False)
             ),
@@ -9882,7 +10007,7 @@ class PrintScheduler:
             update(PrintQueueItem)
             .where(PrintQueueItem.id == item.id)
             .where(PrintQueueItem.status == "printing")
-            .values(status="pending", started_at=None, color_substitutions=None)
+            .values(status="pending", started_at=None, color_substitutions=None, dispatch_phase=None, sent_at=None)
             .execution_options(synchronize_session=False)
         )
         await db.commit()
@@ -10667,6 +10792,8 @@ class PrintScheduler:
                 started_at=now_utc,
                 billing_run_id=billing_run_id,
                 color_substitutions=color_substitutions,
+                dispatch_phase="sent",
+                sent_at=now_utc,
             )
         )
         await db.commit()
@@ -11031,13 +11158,16 @@ class PrintScheduler:
             # of the just-finished job (#1078).
             if pre_state:
                 spawn_background_task(
-                    self._watchdog_print_start(
+                    self._watch_send(
                         item.id,
-                        item.printer_id,
-                        pre_state,
-                        pre_subtask_id,
-                        pre_gcode_file,
-                        created_by_id=toast_uid,
+                        self._watchdog_print_start(
+                            item.id,
+                            printer.id,
+                            pre_state,
+                            pre_subtask_id,
+                            pre_gcode_file,
+                            created_by_id=toast_uid,
+                        ),
                     ),
                     name=f"watchdog-print-start-{item.id}",
                 )
@@ -11229,6 +11359,7 @@ class PrintScheduler:
                 # queue item stuck in 'printing' forever (#1370).
                 scheduler._release_dispatch_hold(printer_id)
                 scheduler._sent_unstarted_print.pop(queue_item_id, None)
+                await scheduler._confirm_started(queue_item_id)
                 try:
                     await ws_manager.send_queue_item_acked(
                         user_id=created_by_id,
@@ -11271,6 +11402,7 @@ class PrintScheduler:
                 if status.state in _ACTIVE_PRINT_STATES:
                     scheduler._release_dispatch_hold(printer_id)
                     scheduler._sent_unstarted_print.pop(queue_item_id, None)
+                    await scheduler._confirm_started(queue_item_id)
                     try:
                         await ws_manager.send_queue_item_acked(
                             user_id=created_by_id,
@@ -11326,6 +11458,8 @@ class PrintScheduler:
                 return "already_moved_on"
             item.dispatch_attempts = (item.dispatch_attempts or 0) + 1
             item.started_at = None
+            item.dispatch_phase = None
+            item.sent_at = None
             # The print never started: no slot printed in any colour (#3279).
             item.color_substitutions = None
             # Charge the attempt to the candidate that was actually dispatched, so

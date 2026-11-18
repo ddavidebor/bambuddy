@@ -159,6 +159,17 @@ class PrintQueueItem(Base):
     # (no coroutine survives a restart), so a stale claim never wedges an item.
     dispatching_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Where a dispatch has got to, so the queue can say whether the job has
+    # actually reached the printer. "uploading" while the file is sent (the row
+    # is still pending); "sent" from the moment the row turns printing, which is
+    # just before the start command, until the printer is seen to start. NULL
+    # otherwise: not being dispatched, or printing confirmed. Persisted, so a
+    # restart can tell a confirmed print from one whose start was never seen
+    # (see PrintScheduler._reconcile_unconfirmed_sends). ``sent_at`` is when it
+    # turned "sent".
+    dispatch_phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     # Cleared by the per-printer "Resume after failure" action (#1818) so the
     # scheduler's `_check_previous_success` lookback skips this row. Without
     # this, a single `failed` or `aborted` print poisoned every later

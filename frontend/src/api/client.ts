@@ -2900,6 +2900,12 @@ export interface PrintQueueItem {
   target_location: string | null;  // Target location filter for model-based assignment
   required_filament_types: string[] | null;  // Required filament types for model-based assignment
   waiting_reason: string | null;  // Why this job hasn't started yet (empty once it can)
+  // How far its dispatch has got: the file is being uploaded (with percent), or
+  // the start command is out and the printer not yet seen to start. Null when
+  // not dispatching, or once printing is confirmed.
+  dispatch_phase?: 'uploading' | 'sent' | null;
+  upload_progress?: number | null;
+  sent_at?: string | null;
   // Cross-model alternatives (#671), in priority order. Empty for ordinary
   // items. Present until dispatch resolves one, after which library_file_id and
   // target_model name the candidate that actually ran.

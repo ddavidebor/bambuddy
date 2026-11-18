@@ -1625,6 +1625,8 @@ export default {
     status: {
       pending: 'In afwachting',
       waiting: 'Wachten',
+      uploading: 'Bezig met uploaden',
+      sent: 'Verzonden, wacht op printer',
       printing: 'Bezig met afdrukken',
       paused: 'Gepauzeerd',
       completed: 'Voltooid',

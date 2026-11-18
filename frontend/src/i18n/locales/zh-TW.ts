@@ -1609,6 +1609,8 @@ export default {
     status: {
       pending: '等待中',
       waiting: '等待中',
+      uploading: '正在上傳',
+      sent: '已傳送，等待印表機',
       printing: '列印中',
       paused: '已暫停',
       completed: '已完成',

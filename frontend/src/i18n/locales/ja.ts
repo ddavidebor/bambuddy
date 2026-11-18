@@ -1608,6 +1608,8 @@ export default {
     status: {
       pending: '待機中',
       waiting: '待機中',
+      uploading: 'アップロード中',
+      sent: '送信済み、プリンター待ち',
       printing: '印刷中',
       paused: '一時停止',
       completed: '完了',

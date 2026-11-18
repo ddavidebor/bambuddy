@@ -1554,6 +1554,8 @@ export default {
     status: {
       pending: "Ожидает",
       waiting: "Ожидание",
+      uploading: "Загрузка",
+      sent: "Отправлено, ожидание принтера",
       printing: "Печать",
       paused: "Приостановлено",
       completed: "Завершено",

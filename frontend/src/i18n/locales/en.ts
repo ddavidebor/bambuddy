@@ -1627,6 +1627,8 @@ export default {
     status: {
       pending: 'Pending',
       waiting: 'Waiting',
+      uploading: 'Uploading',
+      sent: 'Sent, waiting for printer',
       printing: 'Printing',
       paused: 'Paused',
       completed: 'Completed',

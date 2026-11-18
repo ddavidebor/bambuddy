@@ -2027,6 +2027,36 @@ describe('QueuePage', () => {
     });
   });
 
+  describe('dispatch progress', () => {
+    it('shows a job being uploaded, and one sent but not yet started', async () => {
+      server.use(
+        http.get('/api/v1/queue/', () =>
+          HttpResponse.json([
+            {
+              ...mockQueueItems[0],
+              id: 41,
+              status: 'pending',
+              archive_name: 'Uploading job',
+              dispatch_phase: 'uploading',
+              upload_progress: 63.4,
+            },
+            {
+              ...mockQueueItems[0],
+              id: 42,
+              status: 'printing',
+              archive_name: 'Sent job',
+              dispatch_phase: 'sent',
+            },
+          ]),
+        ),
+      );
+      render(<QueuePage />);
+
+      expect(await screen.findByText(/Uploading 63%/)).toBeInTheDocument();
+      expect(screen.getByText('Sent, waiting for printer')).toBeInTheDocument();
+    });
+  });
+
   // #2667: mobile can't drag-reorder the queue, so pending rows get up/down
   // arrows. They persist via the same POST /queue/move as drag. The
   // buttons live in the DOM at every width (Tailwind `sm:hidden` is CSS-only),

@@ -1609,6 +1609,8 @@ export default {
     status: {
       pending: 'Pendiente',
       waiting: 'En espera',
+      uploading: 'Subiendo',
+      sent: 'Enviado, esperando a la impresora',
       printing: 'Imprimiendo',
       paused: 'En pausa',
       completed: 'Completada',
