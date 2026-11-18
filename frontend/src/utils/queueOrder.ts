@@ -1,14 +1,10 @@
 /**
  * The order the scheduler will actually dispatch pending queue items in.
  *
- * The backend decides this in `print_scheduler.check_queue`:
- *
- *     ORDER BY been_jumped DESC,
- *              print_time_seconds ASC NULLS LAST,
- *              position, id
- *
- * with the first two keys only when Shortest-Job-First is on, and then moves a
- * scheduled job whose time has come ahead of everything else, earliest first. It is one order
+ * The backend decides this in `queue_rules.queue_order_key`: position, or with
+ * Shortest-Job-First on, jumped items first (by position), then print time
+ * ascending with unknown last, then position; and a scheduled job whose time
+ * has come ahead of everything else, earliest first. It is one order
  * across the whole queue, not one per printer (#3200): a job pinned to a
  * printer and an "Any <model>" job both want that printer, and the one higher
  * in this order gets it. Every UI surface that claims to show queue order has
@@ -69,9 +65,13 @@ export function compareQueueOrder(
 
     // Shortest first, and an item whose duration we don't know yet sorts last
     // rather than winning by looking like a zero-second print (NULLS LAST).
-    const aTime = a.print_time_seconds ?? Infinity;
-    const bTime = b.print_time_seconds ?? Infinity;
-    if (aTime !== bTime) return aTime - bTime;
+    // Jumped items among themselves go by position: by print time again, a
+    // long one would be overtaken by every shorter one jumped after it.
+    if (!aJumped) {
+      const aTime = a.print_time_seconds ?? Infinity;
+      const bTime = b.print_time_seconds ?? Infinity;
+      if (aTime !== bTime) return aTime - bTime;
+    }
   }
 
   if (a.position !== b.position) return a.position - b.position;

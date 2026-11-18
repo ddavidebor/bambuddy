@@ -35,15 +35,22 @@ def is_due_scheduled(item, now: datetime) -> bool:
 def queue_order_key(item, *, sjf: bool, now: datetime) -> tuple:
     """The order jobs get printers in.
 
-    Queue position, or Shortest-Job-First with its starvation guard when that is
-    on. A scheduled job whose time has come goes ahead of all of them, earliest
+    Queue position, or Shortest-Job-First when that is on: shortest first, no
+    estimate last. Its starvation guard puts a job that was jumped ahead of the
+    rest, and among those it is first come, first served by position. Ordering
+    them by print time again let a long jumped job be overtaken by every
+    shorter one jumped after it, which is the starvation the guard is for.
+
+    A scheduled job whose time has come goes ahead of all of them, earliest
     time first: it was promised that time, and a printer busy then must not hand
     it to whatever sits higher once it frees.
     """
     head = (0, aware_utc(item.scheduled_time)) if is_due_scheduled(item, now) else (1,)
-    if sjf:
+    if sjf and item.been_jumped:
+        rest = (0, item.position, item.id)
+    elif sjf:
         seconds = item.print_time_seconds
-        rest = (not item.been_jumped, seconds is None, seconds or 0, item.position, item.id)
+        rest = (1, seconds is None, seconds or 0, item.position, item.id)
     else:
         rest = (item.position, item.id)
     return head, rest

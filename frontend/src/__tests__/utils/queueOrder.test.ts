@@ -141,3 +141,14 @@ describe('compareQueueOrder with scheduled jobs', () => {
     expect(order(items)).toEqual([1, 2, 3]);
   });
 });
+
+describe('compareQueueOrder, jumped items under SJF', () => {
+  it('serves jumped items first come, first served, not shortest first', () => {
+    const items = [
+      item(1, { position: 1, print_time_seconds: 9000, been_jumped: true }),
+      item(2, { position: 2, print_time_seconds: 60, been_jumped: true }),
+      item(3, { position: 3, print_time_seconds: 30 }),
+    ];
+    expect(idsInOrder(items, true)).toEqual([1, 2, 3]);
+  });
+});
