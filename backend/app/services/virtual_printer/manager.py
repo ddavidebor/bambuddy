@@ -23,6 +23,7 @@ from backend.app.models.virtual_printer import (
 )
 from backend.app.services import slicer_ams_pick
 from backend.app.services.bambu_mqtt import resolve_external_spools_in_mapping
+from backend.app.services.queue_print_time import queue_print_time
 from backend.app.services.virtual_printer.bind_server import BindServer
 from backend.app.services.virtual_printer.camera_bridge import CHAMBER, RTSP, AcceptedCode, CameraBridge
 from backend.app.services.virtual_printer.certificate import CertificateService
@@ -1385,6 +1386,7 @@ class VirtualPrinterInstance:
                             cleanup_library_after_dispatch=remove_after_print,
                             plate_id=plate_id,
                             position=max_pos + offset,
+                            print_time_seconds=queue_print_time(None, library_file, plate_id),
                             status="pending",
                             manual_start=not self.auto_dispatch or review_required,
                             required_filament_types=required_filament_types_json,

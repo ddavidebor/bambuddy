@@ -83,6 +83,7 @@ from backend.app.services.print_cost_estimate import estimate_queue_source_cost
 from backend.app.services.queue_announcements import announce_queue_jobs_added
 from backend.app.services.queue_item_printer import PRINTER_RESOLVED_DEFAULTS, drop_printer_resolved
 from backend.app.services.queue_position import lock_queue_positions, max_queue_position, move_queue_items
+from backend.app.services.queue_print_time import queue_print_time
 from backend.app.utils.printer_models import (
     is_gcode_compatible,
 )
@@ -2696,31 +2697,7 @@ async def update_queue_item(
     return _enrich_response(item)
 
 
-def _cached_print_time(
-    archive: PrintArchive | None, library_file: LibraryFile | None, plate_id: int | None
-) -> int | None:
-    """The slicer's time for the plate a queue item prints, cached on it for
-    shortest-job-first: the plate's own from the 3MF, else the whole file's."""
-    cached_print_time = None
-    if archive:
-        cached_print_time = archive.print_time_seconds
-        if plate_id:
-            archive_path = settings.base_dir / archive.file_path
-            if archive_path.exists():
-                plate_time = _extract_print_time_from_3mf(archive_path, plate_id)
-                if plate_time is not None:
-                    cached_print_time = plate_time
-    elif library_file:
-        if library_file.file_metadata:
-            cached_print_time = library_file.file_metadata.get("print_time_seconds")
-        if plate_id:
-            lib_path = Path(library_file.file_path)
-            library_file_path = lib_path if lib_path.is_absolute() else settings.base_dir / library_file.file_path
-            if library_file_path.exists():
-                plate_time = _extract_print_time_from_3mf(library_file_path, plate_id)
-                if plate_time is not None:
-                    cached_print_time = plate_time
-    return cached_print_time
+_cached_print_time = queue_print_time
 
 
 async def _remove_queue_item(db: AsyncSession, item: PrintQueueItem) -> bool:

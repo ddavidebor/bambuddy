@@ -6090,6 +6090,7 @@ async def _run_migrations(conn):
     # and a restart can recover a send whose start was never seen. Nullable, no
     # default; the timestamp type differs by dialect as for dispatching_at.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN dispatch_phase VARCHAR(16)")
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN sent_subtask_id VARCHAR(64)")
     if is_sqlite():
         await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN sent_at DATETIME")
     else:

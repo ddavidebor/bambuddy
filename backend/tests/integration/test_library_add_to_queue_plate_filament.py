@@ -113,3 +113,21 @@ async def test_a_single_plate_file_keeps_no_plate(async_client, db_session, prin
 
     item = await db_session.get(PrintQueueItem, response.json()["id"])
     assert item.plate_id is None
+
+
+async def test_a_bulk_add_carries_the_files_print_time(
+    async_client, db_session, printer_factory, tmp_path, monkeypatch
+):
+    """Without it the job counts as a day long next to a scheduled job (queue_rules)."""
+    await printer_factory(model="X1C")
+    lib_file = await _library_file(db_session, tmp_path, monkeypatch)
+    lib_file.file_metadata = {**lib_file.file_metadata, "print_time_seconds": 4200}
+    await db_session.commit()
+
+    response = await async_client.post(
+        "/api/v1/library/files/add-to-queue", json={"file_ids": [lib_file.id], "target_model": "X1C"}
+    )
+
+    assert response.status_code == 200, response.text
+    item = await db_session.scalar(select(PrintQueueItem).where(PrintQueueItem.library_file_id == lib_file.id))
+    assert item.print_time_seconds == 4200

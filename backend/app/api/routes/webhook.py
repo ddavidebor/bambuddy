@@ -30,6 +30,7 @@ from backend.app.services.print_defaults import default_print_options
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_announcements import announce_queue_jobs_added
 from backend.app.services.queue_position import next_queue_position
+from backend.app.services.queue_print_time import queue_print_time
 from backend.app.utils.local_time import to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,7 @@ async def webhook_add_to_queue(
         archive_id=data.archive_id,
         project_id=data.project_id,
         position=next_position,
+        print_time_seconds=queue_print_time(archive, None, None),
         scheduled_time=scheduled_time,
         require_previous_success=data.require_previous_success,
         auto_off_after=data.auto_off_after,

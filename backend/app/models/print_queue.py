@@ -169,6 +169,10 @@ class PrintQueueItem(Base):
     # turned "sent".
     dispatch_phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The printer's subtask_id just before the send. Still the printer's after
+    # the send is the one proof the job never started there, which is what lets
+    # the reconcile sweep put it back in the queue without risking a reprint.
+    sent_subtask_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Cleared by the per-printer "Resume after failure" action (#1818) so the
     # scheduler's `_check_previous_success` lookback skips this row. Without

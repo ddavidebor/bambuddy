@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.print_scheduler import (
@@ -34,7 +35,7 @@ async def _row(ctx, item_id) -> PrintQueueItem:
         return await db.get(PrintQueueItem, item_id)
 
 
-async def _sent(ctx, *, minutes_ago: float, attempts: int = 0) -> int:
+async def _sent(ctx, *, minutes_ago: float, attempts: int = 0, subtask: str | None = "100") -> int:
     item_id = await add_job(ctx, printer_id=1)
     async with ctx.session_maker() as db:
         item = await db.get(PrintQueueItem, item_id)
@@ -44,14 +45,15 @@ async def _sent(ctx, *, minutes_ago: float, attempts: int = 0) -> int:
         item.sent_at = sent.replace(tzinfo=None)
         item.started_at = sent.replace(tzinfo=None)
         item.dispatch_attempts = attempts
+        item.sent_subtask_id = subtask
         await db.commit()
     return item_id
 
 
-def _printer(state: str, connected: bool = True):
+def _printer(state: str, connected: bool = True, subtask: str | None = "100"):
     return patch(
         "backend.app.services.print_scheduler.printer_manager.get_status",
-        MagicMock(return_value=PrinterState(connected=connected, state=state)),
+        MagicMock(return_value=PrinterState(connected=connected, state=state, subtask_id=subtask)),
     )
 
 
@@ -90,7 +92,7 @@ class TestThePhaseFollowsTheDispatch:
 
 class TestASendNoWatchdogIsWatching:
     @pytest.mark.asyncio
-    async def test_goes_back_to_the_queue_when_the_printer_never_started(self, ctx):
+    async def test_goes_back_to_the_queue_when_the_printer_is_still_on_its_old_subtask(self, ctx):
         item_id = await _sent(ctx, minutes_ago=STALE)
 
         with _printer("IDLE"), patch("backend.app.services.print_batch.refresh_batches_after", AsyncMock()):
@@ -109,6 +111,23 @@ class TestASendNoWatchdogIsWatching:
         row = await _row(ctx, item_id)
         assert row.status == "failed"
         assert "never started printing" in row.error_message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stored", ["100", None], ids=["ran_since", "nothing_stored"])
+    async def test_is_not_requeued_without_proof_it_never_ran(self, ctx, stored):
+        """Bambuddy down while the print ran and finished: the printer is idle on
+        a new subtask. Requeueing would print the job again; it is left to the
+        stranded-item sweep, which closes it with the printer's status."""
+        item_id = await _sent(ctx, minutes_ago=STALE, subtask=stored)
+
+        with (
+            _printer("FINISH", subtask="200"),
+            patch("backend.app.services.print_batch.refresh_batches_after", AsyncMock()),
+        ):
+            await PrintScheduler()._reconcile_unconfirmed_sends()
+
+        row = await _row(ctx, item_id)
+        assert (row.status, row.dispatch_phase, row.dispatch_attempts) == ("printing", None, 0)
 
     @pytest.mark.asyncio
     async def test_is_confirmed_when_the_printer_is_printing(self, ctx):
@@ -147,3 +166,20 @@ class TestASendNoWatchdogIsWatching:
             await scheduler._close_stranded_printing_items()
 
         assert (await _row(ctx, item_id)).status == "printing"
+
+
+class TestJobsQueuedWithoutAPrintTime:
+    @pytest.mark.asyncio
+    async def test_get_their_files_time_at_startup(self, ctx):
+        """Otherwise each counts as a day long and waits behind any job scheduled within it."""
+        item_id = await add_job(ctx, printer_id=1)
+        async with ctx.session_maker() as db:
+            item = await db.get(PrintQueueItem, item_id)
+            item.print_time_seconds = None
+            library_file = await db.get(LibraryFile, item.library_file_id)
+            library_file.file_metadata = {**(library_file.file_metadata or {}), "print_time_seconds": 5400}
+            await db.commit()
+
+        await PrintScheduler._backfill_print_times()
+
+        assert (await _row(ctx, item_id)).print_time_seconds == 5400

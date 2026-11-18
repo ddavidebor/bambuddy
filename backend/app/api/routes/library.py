@@ -108,6 +108,7 @@ from backend.app.services.print_confirmation import confirm_outcome_for_new_queu
 from backend.app.services.print_defaults import default_print_options
 from backend.app.services.process_overrides import apply_process_overrides
 from backend.app.services.queue_announcements import announce_queue_jobs_added
+from backend.app.services.queue_print_time import queue_print_time
 from backend.app.services.slice_output_check import (
     missing_start_gcode_message,
     start_gcode_is_missing,
@@ -3461,6 +3462,7 @@ async def add_files_to_queue(
                 required_filament_types=required_filament_types,
                 plate_id=printed_plate,
                 library_file_id=file_id,
+                print_time_seconds=queue_print_time(None, lib_file, printed_plate),
                 project_id=lib_file.project_id
                 or (folder_projects.get(lib_file.folder_id) if lib_file.folder_id is not None else None),
                 position=max_position,

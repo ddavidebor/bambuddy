@@ -667,6 +667,7 @@ def _make_orchestration_callable(
                     printer_id=printer_id,
                     target_model=target_model,
                     position=position,
+                    print_time_seconds=slice_response.print_time_seconds,
                     library_file_id=slice_response.library_file_id,
                     # From the run as refreshed after the slice, not the id the
                     # request started with: a user deleted meanwhile is gone

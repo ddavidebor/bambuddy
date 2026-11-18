@@ -1676,6 +1676,7 @@ class PrintScheduler:
         logger.info("Print scheduler started")
 
         await self._clear_stale_dispatch_claims(at_startup=True)
+        await self._backfill_print_times()
 
         while self._running:
             dispatched = False
@@ -1788,6 +1789,39 @@ class PrintScheduler:
             # that can itself break the scheduler loop is worse than the strand.
             logger.error("Stranded-item sweep failed: %s", e)
 
+    @staticmethod
+    async def _backfill_print_times() -> None:
+        """Give pending rows queued without a print time the one their file has.
+
+        The library, webhook, pipeline and virtual printer paths used to leave it
+        empty. A row without one is taken to run for a day when a scheduled
+        job's printer is held (queue_rules), so it would wait behind any job
+        scheduled within that day. Rows queued since get it at creation.
+        """
+        from backend.app.services.queue_print_time import queue_print_time
+
+        try:
+            async with async_session() as db:
+                rows = (
+                    await db.execute(
+                        select(PrintQueueItem)
+                        .where(PrintQueueItem.status == "pending")
+                        .where(PrintQueueItem.print_time_seconds.is_(None))
+                        .options(selectinload(PrintQueueItem.archive), selectinload(PrintQueueItem.library_file))
+                    )
+                ).scalars()
+                filled = 0
+                for item in rows:
+                    seconds = queue_print_time(item.archive, item.library_file, item.plate_id)
+                    if seconds:
+                        item.print_time_seconds = seconds
+                        filled += 1
+                if filled:
+                    await db.commit()
+                    logger.info("Filled in the print time of %d queued job(s) that were queued without one", filled)
+        except Exception as e:
+            logger.warning("Print-time backfill failed: %s", e)
+
     def upload_progress(self, item_id: int) -> float | None:
         """Percent of the item's file uploaded so far, or None if no upload is running."""
         return _upload_progress.get(item_id)
@@ -1825,10 +1859,13 @@ class PrintScheduler:
         it ever started. The stranded-item sweep then closed it as cancelled once
         the printer sat idle, so a job that never printed left the queue as if
         someone had cancelled it. This takes such rows over once the watchdog's
-        own window has passed: printing means it started; idle means it did not,
-        and it goes back to the queue like a watchdog revert, within the same
-        retry budget. A disconnected printer proves nothing and is left for a
-        later pass.
+        own window has passed. Back in the queue, within the watchdog's retry
+        budget, only on proof it never started: the printer idle and still on
+        the subtask it reported before the send. Anything else (printing, or
+        idle having run something since, which a missed completion while
+        Bambuddy was down looks like) only drops "sent", and the stranded-item
+        sweep closes a finished print as usual; requeueing that would print it
+        again. A disconnected printer proves nothing and is left for later.
         """
         try:
             async with async_session() as db:
@@ -1848,12 +1885,27 @@ class PrintScheduler:
                     state = printer_manager.get_status(item.printer_id) if item.printer_id else None
                     if state is None or not state.connected:
                         continue
-                    if state.state in _ACTIVE_PRINT_STATES:
+                    never_started = (
+                        state.state in _TERMINAL_STATE_QUEUE_STATUS
+                        and item.sent_subtask_id is not None
+                        and state.subtask_id is not None
+                        and str(state.subtask_id) == item.sent_subtask_id
+                    )
+                    if state.state in _ACTIVE_PRINT_STATES or (
+                        state.state in _TERMINAL_STATE_QUEUE_STATUS and not never_started
+                    ):
+                        # Printing, or idle having run something since the send,
+                        # or no way to tell: it is not "sent" any more. If its
+                        # print is over, the stranded-item sweep closes it with
+                        # the status the printer reports. Requeueing on anything
+                        # less than proof would reprint a job that already ran.
                         item.dispatch_phase = None
-                    elif state.state in _TERMINAL_STATE_QUEUE_STATUS:
+                    elif never_started:
+                        still_on = item.sent_subtask_id
                         item.dispatch_attempts = (item.dispatch_attempts or 0) + 1
                         item.dispatch_phase = None
                         item.sent_at = None
+                        item.sent_subtask_id = None
                         item.started_at = None
                         if item.dispatch_attempts >= DISPATCH_MAX_ATTEMPTS:
                             item.status = "failed"
@@ -1866,10 +1918,11 @@ class PrintScheduler:
                             item.status = "pending"
                         self._forget_unstarted_print(item.id, unless_printing=True)
                         logger.warning(
-                            "Queue item %s: sent to printer %s at %s and never seen to start; %s",
+                            "Queue item %s: sent to printer %s at %s and never started (its subtask is still %s); %s",
                             item.id,
                             item.printer_id,
                             sent_at.isoformat(),
+                            still_on,
                             "failed, out of attempts" if item.status == "failed" else "back in the queue",
                         )
                     else:
@@ -11044,6 +11097,16 @@ class PrintScheduler:
         )
 
         if started:
+            # What the printer reported before the send, kept on the row: the
+            # reconcile sweep requeues an unconfirmed send only while the
+            # printer still reports it.
+            if pre_subtask_id is not None:
+                await db.execute(
+                    update(PrintQueueItem)
+                    .where(PrintQueueItem.id == item.id)
+                    .values(sent_subtask_id=str(pre_subtask_id))
+                )
+                await db.commit()
             # The command is away, so the expectation is now legitimate and must
             # survive. Anything still in this dict when _dispatch_one exits gets
             # rolled back.
