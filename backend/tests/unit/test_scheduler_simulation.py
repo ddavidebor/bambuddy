@@ -11,7 +11,8 @@ do, and after every pass checks the rules a user relies on:
 * no idle printer while a job that may run on it waits;
 * no job is sent to a printer that is printing, offline or backing off;
 * a scheduled job's printer is not given to a job that would still be running
-  at its time (``SCHEDULED`` runs only).
+  at its time (``SCHEDULED`` runs only);
+* the projection the timeline draws starts exactly the jobs the pass sent.
 
 The rules are written once, in ``_Rules``, independently of the scheduler's
 code. A violation prints the seed; ``SIM_SEEDS=500`` runs more of them.
@@ -38,6 +39,7 @@ from backend.app.models.printer import Printer
 from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.print_scheduler import PrintScheduler
 from backend.app.services.queue_position import move_queue_items
+from backend.app.services.queue_projection import ProjectedPrinter, project
 
 PRINTERS = {1: "P1S", 2: "P1S", 3: "P1S", 4: "X1C"}
 START = datetime(2026, 3, 2, 8, 0, tzinfo=timezone.utc)
@@ -365,6 +367,28 @@ class _Sim:
         ids, item_printers, _limit = launched.call_args[0]
         return {i: item_printers[i] for i in ids}
 
+    async def projected_now(self, db, rules: "_Rules") -> set[int]:
+        """The jobs the projection starts at this instant, from the same state the pass sees."""
+        from sqlalchemy.orm import selectinload
+
+        items = list(
+            (
+                await db.execute(
+                    select(PrintQueueItem)
+                    .where(PrintQueueItem.status == "pending")
+                    .options(selectinload(PrintQueueItem.variants))
+                )
+            ).scalars()
+        )
+        printers = [
+            ProjectedPrinter(
+                id=pid, model=p.model, location=None, free_at=self.clock.now if rules.free(pid) else None, wear=(pid,)
+            )
+            for pid, p in self.printers.items()
+        ]
+        projection = project(items, printers, self.clock.now, sjf=False)
+        return {i for i, entry in projection.items() if entry.start == self.clock.now}
+
     async def run(self, steps: int) -> list[str]:
         for _ in range(steps):
             async with self.session_maker() as db:
@@ -378,7 +402,13 @@ class _Sim:
                 backoff=dict(self.scheduler._upload_backoff),
                 scheduled_rule=self.scheduled,
             )
+            async with self.session_maker() as db:
+                projected = await self.projected_now(db, rules)
             dispatched = await self.run_pass()
+            if projected != set(dispatched):
+                rules.violations.append(
+                    f"{self.clock.now:%H:%M} projection starts {sorted(projected)}, the pass sent {sorted(dispatched)}"
+                )
             self.dispatches += len(dispatched)
             rules.check(dispatched)
             self.violations += rules.violations

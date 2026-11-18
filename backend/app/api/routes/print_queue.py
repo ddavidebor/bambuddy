@@ -63,6 +63,7 @@ from backend.app.schemas.print_queue import (
     PrintQueueItemUpdate,
     PrintQueueMove,
     PrintQueueReorder,
+    QueueProjectionEntry,
     QueueVariantCreate,
     QueueVariantSummary,
 )
@@ -882,6 +883,42 @@ def _history_conditions(
             )
         )
     return conditions
+
+
+@router.get("/projection", response_model=list[QueueProjectionEntry])
+async def get_queue_projection(
+    db: AsyncSession = Depends(get_db, scope="function"),
+    auth_result: tuple[User | ApiKeyActor | None, bool] = Depends(
+        require_ownership_permission(
+            Permission.QUEUE_READ_ALL,
+            Permission.QUEUE_READ_OWN,
+        )
+    ),
+    printer_scope: PrinterScope = RequestPrinterScope,
+):
+    """When each pending job is projected to start, by the scheduler's own rules.
+
+    Worked out over the whole queue, since a job the caller cannot see still
+    takes a printer; only the caller's own entries are returned.
+    """
+    from backend.app.services.queue_projection import project_queue
+    from backend.app.utils.local_time import to_naive_utc
+
+    user, can_read_all = auth_result
+    projection = await project_queue(db)
+    visible = set(projection)
+    if user is not None and not can_read_all:
+        own = await db.execute(
+            select(PrintQueueItem.id).where(PrintQueueItem.id.in_(visible), PrintQueueItem.created_by_id == user.id)
+        )
+        visible = {row[0] for row in own.all()}
+    return [
+        QueueProjectionEntry(
+            item_id=p.item_id, printer_id=p.printer_id, start=to_naive_utc(p.start), end=to_naive_utc(p.end)
+        )
+        for item_id, p in projection.items()
+        if item_id in visible and printer_scope.allows(p.printer_id)
+    ]
 
 
 @router.get("/history", response_model=PrintQueueHistoryResponse)

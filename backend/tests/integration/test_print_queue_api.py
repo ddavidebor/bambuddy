@@ -3975,6 +3975,89 @@ class TestDispatchProgressOnTheQueue:
         assert by_id[rows["done"]]["dispatch_phase"] is None
 
 
+class TestQueueProjection:
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_jobs_are_projected_by_the_queue_rules(
+        self, async_client: AsyncClient, db_session, printer_factory, archive_factory
+    ):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        printer = await printer_factory()
+        ids = []
+        for position, hours in ((1, 2), (2, 1)):
+            archive = await archive_factory(printer.id, with_run=False)
+            item = PrintQueueItem(
+                printer_id=printer.id,
+                archive_id=archive.id,
+                status="pending",
+                position=position,
+                print_time_seconds=hours * 3600,
+            )
+            db_session.add(item)
+            await db_session.flush()
+            ids.append(item.id)
+        await db_session.commit()
+
+        manager = "backend.app.services.printer_manager.printer_manager"
+        with (
+            patch(f"{manager}.get_status", MagicMock(return_value=PrinterState(connected=True, state="IDLE"))),
+            patch(f"{manager}.is_connected", MagicMock(return_value=True)),
+            patch(f"{manager}.is_awaiting_plate_clear", MagicMock(return_value=False)),
+        ):
+            response = await async_client.get("/api/v1/queue/projection")
+
+        assert response.status_code == 200
+        entries = {e["item_id"]: e for e in response.json()}
+        first, second = (entries[i] for i in ids)
+        assert first["printer_id"] == second["printer_id"] == printer.id
+        assert first["end"] == second["start"]
+        started = datetime.fromisoformat(first["start"].replace("Z", "+00:00"))
+        assert abs(started - datetime.now(timezone.utc)) < timedelta(minutes=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_job_held_for_the_user_takes_no_printer(
+        self, async_client: AsyncClient, db_session, printer_factory, archive_factory
+    ):
+        """It does not start until they act, so it is left out; one that is only busy is not."""
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        printer = await printer_factory()
+        ids = {}
+        for position, reason in ((1, "Waiting on Enclosure Door"), (2, "Busy: Test Printer")):
+            archive = await archive_factory(printer.id, with_run=False)
+            item = PrintQueueItem(
+                printer_id=printer.id,
+                archive_id=archive.id,
+                status="pending",
+                position=position,
+                print_time_seconds=3600,
+                waiting_reason=reason,
+            )
+            db_session.add(item)
+            await db_session.flush()
+            ids[reason] = item.id
+        await db_session.commit()
+
+        manager = "backend.app.services.printer_manager.printer_manager"
+        with (
+            patch(f"{manager}.get_status", MagicMock(return_value=PrinterState(connected=True, state="IDLE"))),
+            patch(f"{manager}.is_connected", MagicMock(return_value=True)),
+            patch(f"{manager}.is_awaiting_plate_clear", MagicMock(return_value=False)),
+        ):
+            response = await async_client.get("/api/v1/queue/projection")
+
+        assert [e["item_id"] for e in response.json()] == [ids["Busy: Test Printer"]]
+
+
 class TestForceColorOverridesAreScopedToThePlate:
     """Queueing several plates of one 3MF must not make each plate wait on the
     colours of its siblings (#2551).

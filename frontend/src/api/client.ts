@@ -2893,6 +2893,13 @@ export interface DiscoveredTasmotaDevice {
 }
 
 // Print Queue types
+export interface QueueProjectionEntry {
+  item_id: number;
+  printer_id: number;
+  start: string;
+  end: string | null;  // null: no print-time estimate
+}
+
 export interface PrintQueueItem {
   id: number;
   printer_id: number | null;  // null = unassigned
@@ -6980,6 +6987,8 @@ export const api = {
     }),
 
   // Print Queue
+  // When each pending job is projected to start, by the scheduler's own rules.
+  getQueueProjection: () => request<QueueProjectionEntry[]>('/queue/projection'),
   getQueue: (printerId?: number, status?: string, targetModel?: string) => {
     const params = new URLSearchParams();
     if (printerId) params.set('printer_id', String(printerId));

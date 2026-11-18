@@ -38,22 +38,6 @@ function dueAt(item: OrderableQueueItem, now: number): number | null {
 }
 
 /**
- * Which swimlane an item is drawn in on the timeline: a named printer, a
- * printer model, or neither. Display only -- lanes do not decide dispatch
- * order, which is global (#3200).
- *
- * Returned as a string rather than a number because the group is a name, not
- * a magnitude. The flat list used to fold `target_model` down to
- * `-charCodeAt(0)`, which gave `X1C` and `X2D` (and `P1S` and `P1P`) the same
- * key and interleaved two lanes into one.
- */
-export function queueLaneKey(item: OrderableQueueItem): string {
-  if (item.printer_id != null) return `printer:${item.printer_id}`;
-  if (item.target_model) return `model:${item.target_model}`;
-  return 'unassigned';
-}
-
-/**
  * Order two pending items the way the scheduler takes them, whichever printer
  * or model each is queued for.
  *

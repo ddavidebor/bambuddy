@@ -1930,6 +1930,13 @@ export function QueuePage() {
   const activeStatuses = filterStatus
     ? (ACTIVE_STATUSES.includes(filterStatus) ? filterStatus : null)
     : ACTIVE_STATUSES.join(',');
+  // Where the timeline draws pending jobs: the scheduler's rules run forward.
+  const { data: projection } = useQuery({
+    queryKey: ['queue-projection'],
+    queryFn: () => api.getQueueProjection(),
+    refetchInterval: 15000,
+    enabled: activeTab === 'timeline',
+  });
   const { data: activeQueue, isLoading } = useQuery({
     queryKey: ['queue', filterPrinter, activeStatuses],
     queryFn: () => api.getQueue(filterPrinter || undefined, activeStatuses ?? undefined),
@@ -2956,7 +2963,7 @@ export function QueuePage() {
           queueItems={queue || []}
           printers={printers || []}
           printerStatuses={printerStatusMap}
-          sjfEnabled={settings?.queue_shortest_first ?? false}
+          projection={projection ?? []}
           onItemClick={(item) => {
             if (['completed', 'failed', 'skipped', 'cancelled'].includes(item.status)) {
               setRequeueItem(item);

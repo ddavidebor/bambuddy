@@ -212,6 +212,15 @@ class ColorSubstitution(BaseModel):
     tray: int
 
 
+class QueueProjectionEntry(BaseModel):
+    """When a pending job is projected to start, and on which printer."""
+
+    item_id: int
+    printer_id: int
+    start: UTCDatetime
+    end: UTCDatetime = None  # None: no print-time estimate
+
+
 class PrintQueueItemResponse(BaseModel):
     id: int
     printer_id: int | None  # None = unassigned

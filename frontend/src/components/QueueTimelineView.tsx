@@ -1,17 +1,16 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 import { ChevronLeft, ChevronRight, Clock, Layers, Printer as PrinterIcon } from 'lucide-react';
 import { formatDuration, parseUTCDate } from '../utils/date';
-import { compareQueueOrder, queueLaneKey } from '../utils/queueOrder';
-import { isBusyOnlyWaitingReason } from '../utils/waitingReason';
-import type { PrintQueueItem, Printer } from '../api/client';
+import type { PrintQueueItem, Printer, QueueProjectionEntry } from '../api/client';
 import { queueItemThumbnailUrl } from '../utils/queueItemThumbnail';
 import { Button } from './Button';
 
-/** Gantt-style 24h-rolling timeline. One horizontal swimlane per printer
- *  (plus one per active target_model and one for unassigned items). Each
- *  pending or printing job is rendered as a colored bar positioned by its
- *  predicted start time, width = predicted duration. A vertical NOW line
- *  marks current time. Hover a bar for details, click to edit/stop. */
+/** Gantt-style 24h-rolling timeline. One horizontal swimlane per printer. Each
+ *  printing job is a bar from its start to its estimated end; each pending job
+ *  sits where the backend's projection (`GET /queue/projection`) puts it, which
+ *  runs the scheduler's own rules forward, so an "Any <model>" job shows on the
+ *  printer it is expected to take. A vertical NOW line marks current time.
+ *  Hover a bar for details, click to edit/stop. */
 
 const HOUR_MS = 60 * 60 * 1000;
 const RANGE_HOURS = 24;
@@ -28,16 +27,17 @@ interface ScheduleEvent {
   estimatedEnd: Date;
   progress?: number;
   type: 'printing' | 'queued';
+  printerId: number;
 }
 
 interface QueueTimelineViewProps {
   queueItems: PrintQueueItem[];
   printers: Printer[];
   printerStatuses: Record<number, { progress?: number; remaining_time?: number; state?: string }>;
-  /** `queue_shortest_first`. The bars chain in dispatch order, and dispatch
-   *  order depends on it, so without it the timeline drew a queue the
-   *  scheduler had no intention of running (#3043). */
-  sjfEnabled: boolean;
+  /** Projected starts of pending jobs. A pending job with none is not drawn:
+   *  it is staged, held for the user, or behind something the projection
+   *  cannot see the end of, and any bar would be a guess. */
+  projection: QueueProjectionEntry[];
   onItemClick: (item: PrintQueueItem) => void;
   t: (key: string, options?: Record<string, unknown>) => string;
 }
@@ -45,10 +45,6 @@ interface QueueTimelineViewProps {
 interface LaneDescriptor {
   key: string;
   label: string;
-  /** null for model-based / unassigned lanes. */
-  printerId: number | null;
-  /** Set for model-based lanes (`Any X1C`). */
-  targetModel: string | null;
 }
 
 function formatHour(date: Date): string {
@@ -63,7 +59,7 @@ export function QueueTimelineView({
   queueItems,
   printers,
   printerStatuses,
-  sjfEnabled,
+  projection,
   onItemClick,
   t,
 }: QueueTimelineViewProps) {
@@ -87,144 +83,59 @@ export function QueueTimelineView({
   const rangeEndMs = rangeStartMs + RANGE_MS;
   const nowMs = now.getTime();
 
-  // Build schedule events. Only committed schedules are rendered:
-  //  • currently printing → always
-  //  • pending with explicit scheduled_time → at that time
-  //  • pending ASAP that chain behind a print actually running on the same
-  //    lane → forecast
-  // Staged (manual_start) and blocked items are not on the timeline because
-  // they won't auto-dispatch — they'd be misleading bars. "Blocked" is not the
-  // same as "has a waiting_reason": since #3074 an item queued behind a running
-  // print carries one too ("Busy: X1C-01"), and that is the chain this view
-  // exists to forecast. Only a reason that needs the user takes an item off.
-  // Idle-printer ASAP queues also stay off until something starts on them.
+  // Printing jobs from their own progress; pending ones from the projection.
   const events = useMemo<ScheduleEvent[]>(() => {
     const result: ScheduleEvent[] = [];
-    const pendingByLaneKey = new Map<string, PrintQueueItem[]>();
-    // Lanes that have an active print right now — only these qualify for
-    // ASAP chain forecasting.
-    const lanesWithActive = new Set<string>();
-    // Chain-end timestamp per lane (where the next pending item's bar starts).
-    const chainEndByLane = new Map<string, number>();
-
     for (const item of queueItems) {
-      if (item.status === 'printing') {
-        const status = item.printer_id != null ? printerStatuses[item.printer_id] : undefined;
-        const start = parseUTCDate(item.started_at) || new Date();
-        let endTime: Date;
-        if (status?.remaining_time != null && status.remaining_time > 0) {
-          endTime = new Date(nowMs + status.remaining_time * 60 * 1000);
-        } else if (item.print_time_seconds) {
-          const progress = status?.progress || 0;
-          const remainingFraction = Math.max(0, 1 - progress / 100);
-          endTime = new Date(nowMs + item.print_time_seconds * remainingFraction * 1000);
-        } else {
-          endTime = new Date(nowMs + HOUR_MS);
-        }
-        result.push({
-          item,
-          estimatedStart: start,
-          estimatedEnd: endTime,
-          progress: status?.progress ?? undefined,
-          type: 'printing',
-        });
-        const lk = queueLaneKey(item);
-        lanesWithActive.add(lk);
-        chainEndByLane.set(lk, Math.max(chainEndByLane.get(lk) ?? nowMs, endTime.getTime()));
-      } else if (item.status === 'pending') {
-        // Skip un-committed pending shapes — staged items and blocked items
-        // won't auto-dispatch, so a bar would lie. An item merely waiting its
-        // turn behind a print does auto-dispatch, and is the whole point of the
-        // chain forecast below.
-        if (item.manual_start) continue;
-        if (item.waiting_reason && !isBusyOnlyWaitingReason(item.waiting_reason)) continue;
-        const lk = queueLaneKey(item);
-        if (!pendingByLaneKey.has(lk)) pendingByLaneKey.set(lk, []);
-        pendingByLaneKey.get(lk)!.push(item);
+      if (item.status !== 'printing' || item.printer_id == null) continue;
+      const status = printerStatuses[item.printer_id];
+      const start = parseUTCDate(item.started_at) || new Date();
+      let endTime: Date;
+      if (status?.remaining_time != null && status.remaining_time > 0) {
+        endTime = new Date(nowMs + status.remaining_time * 60 * 1000);
+      } else if (item.print_time_seconds) {
+        const progress = status?.progress || 0;
+        const remainingFraction = Math.max(0, 1 - progress / 100);
+        endTime = new Date(nowMs + item.print_time_seconds * remainingFraction * 1000);
+      } else {
+        endTime = new Date(nowMs + HOUR_MS);
       }
+      result.push({
+        item,
+        estimatedStart: start,
+        estimatedEnd: endTime,
+        progress: status?.progress ?? undefined,
+        type: 'printing',
+        printerId: item.printer_id,
+      });
     }
 
-    const sixMonthsFromNow = Date.now() + 180 * 24 * HOUR_MS;
-    for (const [lk, items] of pendingByLaneKey) {
-      items.sort((a, b) => compareQueueOrder(a, b, sjfEnabled));
-      const hasActive = lanesWithActive.has(lk);
-      // A lane is timelineable when EITHER it has an active print (chain
-      // forecast off its end) OR its first pending item is scheduled (a
-      // committed anchor exists). Otherwise every chained ASAP item is just
-      // a guess — drop the whole lane to keep the view honest.
-      const firstScheduled = items[0] ? parseUTCDate(items[0].scheduled_time) : null;
-      const firstScheduledOk = firstScheduled && firstScheduled.getTime() <= sixMonthsFromNow;
-      if (!hasActive && !firstScheduledOk) continue;
-
-      let chainEnd = chainEndByLane.get(lk) ?? nowMs;
-      for (const item of items) {
-        const scheduled = parseUTCDate(item.scheduled_time);
-        if (scheduled && scheduled.getTime() <= sixMonthsFromNow) {
-          chainEnd = Math.max(chainEnd, scheduled.getTime());
-        }
-        const duration = (item.print_time_seconds || 3600) * 1000;
-        result.push({
-          item,
-          estimatedStart: new Date(chainEnd),
-          estimatedEnd: new Date(chainEnd + duration),
-          type: 'queued',
-        });
-        chainEnd += duration;
-      }
+    const pendingById = new Map(queueItems.filter((i) => i.status === 'pending').map((i) => [i.id, i]));
+    for (const entry of projection) {
+      const item = pendingById.get(entry.item_id);
+      const start = parseUTCDate(entry.start);
+      if (!item || !start) continue;
+      result.push({
+        item,
+        estimatedStart: start,
+        // No estimate: an hour, so the bar can be seen and clicked.
+        estimatedEnd: parseUTCDate(entry.end) ?? new Date(start.getTime() + HOUR_MS),
+        type: 'queued',
+        printerId: entry.printer_id,
+      });
     }
     return result;
-  }, [queueItems, printerStatuses, nowMs, sjfEnabled]);
+  }, [queueItems, printerStatuses, projection, nowMs]);
 
-  // Lanes: every printer + every distinct target_model with queue activity
-  // + an "unassigned" lane if needed. Printers that have NO events queued
-  // still get a lane so users see idle capacity.
-  const lanes = useMemo<LaneDescriptor[]>(() => {
-    const list: LaneDescriptor[] = [];
-    for (const p of printers) {
-      list.push({
-        key: `printer:${p.id}`,
-        label: p.name,
-        printerId: p.id,
-        targetModel: null,
-      });
-    }
-    const modelLanesAdded = new Set<string>();
-    let hasUnassigned = false;
-    for (const ev of events) {
-      if (ev.item.printer_id != null) continue;
-      if (ev.item.target_model) {
-        const k = `model:${ev.item.target_model}`;
-        if (!modelLanesAdded.has(k)) {
-          modelLanesAdded.add(k);
-          list.push({
-            key: k,
-            label: `${t('queue.filter.any')} ${ev.item.target_model}`,
-            printerId: null,
-            targetModel: ev.item.target_model,
-          });
-        }
-      } else {
-        hasUnassigned = true;
-      }
-    }
-    if (hasUnassigned) {
-      list.push({
-        key: 'unassigned',
-        label: t('queue.filter.unassigned'),
-        printerId: null,
-        targetModel: null,
-      });
-    }
-    return list;
-  }, [printers, events, t]);
+  const lanes = useMemo<LaneDescriptor[]>(
+    () => printers.map((p) => ({ key: `printer:${p.id}`, label: p.name })),
+    [printers],
+  );
 
   const eventsByLane = useMemo(() => {
     const map = new Map<string, ScheduleEvent[]>();
     for (const ev of events) {
-      let key: string;
-      if (ev.item.printer_id != null) key = `printer:${ev.item.printer_id}`;
-      else if (ev.item.target_model) key = `model:${ev.item.target_model}`;
-      else key = 'unassigned';
+      const key = `printer:${ev.printerId}`;
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(ev);
     }
@@ -355,15 +266,9 @@ export function QueueTimelineView({
             {lanes.map((lane) => {
               const laneEvents = eventsByLane.get(lane.key) ?? [];
               return (
-                <div key={lane.key} className="flex border-b border-bambu-dark-tertiary/40 last:border-b-0">
+                <div key={lane.key} data-lane={lane.key} className="flex border-b border-bambu-dark-tertiary/40 last:border-b-0">
                   <div className="w-32 sm:w-40 shrink-0 px-3 py-3 border-r border-bambu-dark-tertiary flex items-center gap-2">
-                    <PrinterIcon className={`w-3.5 h-3.5 shrink-0 ${
-                      lane.printerId == null && lane.targetModel == null
-                        ? 'text-orange-600 dark:text-orange-400'
-                        : lane.targetModel
-                          ? 'text-blue-600 dark:text-blue-400'
-                          : 'text-bambu-green'
-                    }`} />
+                    <PrinterIcon className="w-3.5 h-3.5 shrink-0 text-bambu-green" />
                     <span className="text-sm text-white truncate">{lane.label}</span>
                   </div>
                   <div

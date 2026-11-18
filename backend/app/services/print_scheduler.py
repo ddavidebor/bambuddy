@@ -84,6 +84,12 @@ from backend.app.services.printer_manager import (
     supports_drying_while_printing,
 )
 from backend.app.services.queue_item_printer import drop_printer_resolved
+from backend.app.services.queue_rules import (
+    aware_utc as _aware_utc,
+    queue_order_key,
+    reserved_printer,
+    runs_into_reservation as _runs_into_reservation,
+)
 from backend.app.services.slot_nozzle import reports_two_nozzles
 from backend.app.services.smart_plug_manager import is_monitor_only, publish_plug_state, smart_plug_manager
 from backend.app.services.spool_assignment_notifications import (
@@ -274,35 +280,6 @@ _TERMINAL_STATE_QUEUE_STATUS = {
     "FAILED": "failed",
     "IDLE": "cancelled",
 }
-
-
-# A job with no print-time estimate is taken to run this long when deciding
-# whether it would still be printing at a scheduled job's time: long enough
-# that it never slips in front of one, short enough not to hold a printer for a
-# job scheduled days out.
-UNKNOWN_PRINT_TIME_FOR_RESERVATION = timedelta(hours=24)
-
-
-def _aware_utc(value: datetime | None) -> datetime | None:
-    """A stored naive-UTC datetime as an aware one."""
-    if value is None or value.tzinfo is not None:
-        return value
-    return value.replace(tzinfo=timezone.utc)
-
-
-def _runs_into_reservation(item, upcoming: list[datetime], now: datetime) -> bool:
-    """Whether starting *item* now would still be running at one of *upcoming*.
-
-    *upcoming* are the start times of jobs scheduled on the printer. The earlier
-    schedule wins: a scheduled job is held only by one scheduled before it, so
-    two whose times overlap cannot hold each other off.
-    """
-    if not upcoming:
-        return False
-    seconds = item.print_time_seconds
-    end = now + (timedelta(seconds=seconds) if seconds else UNKNOWN_PRINT_TIME_FOR_RESERVATION)
-    own = _aware_utc(item.scheduled_time)
-    return any(now < t < end and (own is None or t < own) for t in upcoming)
 
 
 def _terminal_queue_status(state) -> str | None:
@@ -2098,18 +2075,11 @@ class PrintScheduler:
             if stale:
                 await db.commit()
 
-            # Scheduled jobs. One whose time has come goes ahead of every job
-            # without one, earliest time first: it was promised a start time,
-            # and a printer that was busy then must not hand it to whatever sits
-            # higher in the list once it frees. The sort is stable, so the
-            # order above holds within each group.
+            # The order the query read is the queue's; queue_order_key adds the
+            # one thing SQL does not, a scheduled job whose time has come going
+            # first. The projection sorts with the same key.
             now_utc = datetime.now(timezone.utc)
-
-            def _due_scheduled(it: PrintQueueItem) -> bool:
-                sched = _aware_utc(it.scheduled_time)
-                return sched is not None and sched <= now_utc and not it.manual_start
-
-            items.sort(key=lambda it: (0, _aware_utc(it.scheduled_time)) if _due_scheduled(it) else (1,))
+            items.sort(key=lambda it: queue_order_key(it, sjf=sjf_enabled, now=now_utc))
 
             # One whose time has not come holds its printer: nothing starts there
             # that would still be running at that time (see
@@ -2119,15 +2089,8 @@ class PrintScheduler:
             # printer reserve it; an "Any <model>" job gets the ordering above.
             reservations: dict[int, list[datetime]] = {}
             for it in items:
-                sched = _aware_utc(it.scheduled_time)
-                if (
-                    it.printer_id is not None
-                    and not (it.target_model or it.variants)
-                    and not it.manual_start
-                    and sched is not None
-                    and sched > now_utc
-                ):
-                    reservations.setdefault(it.printer_id, []).append(sched)
+                if held := reserved_printer(it, now_utc):
+                    reservations.setdefault(held[0], []).append(held[1])
 
             def reserved_against(it: PrintQueueItem) -> set[int]:
                 """Printers *it* may not start on now, for a scheduled job there."""

@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { compareQueueOrder, queueLaneKey } from '../../utils/queueOrder';
+import { compareQueueOrder } from '../../utils/queueOrder';
 
 interface Item {
   id: number;
@@ -77,22 +77,6 @@ describe('compareQueueOrder', () => {
       item(2, { position: 2, print_time_seconds: 3600 }),
     ];
     expect(idsInOrder(items, true)).toEqual([2, 1]);
-  });
-});
-
-describe('queueLaneKey', () => {
-  it('names a lane after the printer, the model, or neither', () => {
-    expect(queueLaneKey(item(1, { printer_id: 4 }))).toBe('printer:4');
-    expect(queueLaneKey(item(2, { printer_id: null, target_model: 'X1C' }))).toBe('model:X1C');
-    expect(queueLaneKey(item(3, { printer_id: null, target_model: null }))).toBe('unassigned');
-  });
-
-  it('keeps two models apart that share a first letter', () => {
-    // The flat pending list used to fold the model down to -charCodeAt(0),
-    // which gave X1C and X2D the same key and interleaved the two lanes.
-    expect(queueLaneKey(item(1, { printer_id: null, target_model: 'X1C' }))).not.toBe(
-      queueLaneKey(item(2, { printer_id: null, target_model: 'X2D' })),
-    );
   });
 });
 

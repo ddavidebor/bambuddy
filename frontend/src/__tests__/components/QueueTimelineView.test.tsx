@@ -1,173 +1,95 @@
 /**
- * The timeline draws each lane's pending jobs chained end to end, so the order
- * it chains them in is a claim about what the scheduler will dispatch next.
+ * The timeline draws pending jobs where the backend's projection puts them.
  *
- * It used to chain by queue position alone, which meant turning
- * Shortest-Job-First on changed the scheduler and the pending list but left
- * the timeline drawing the pre-SJF queue forever (#3043).
+ * It used to chain each lane's jobs itself, by its own copy of the queue order,
+ * and each copy drifted from the scheduler: it ignored Shortest-Job-First
+ * (#3043), and it knew nothing of a scheduled job holding its printer. The
+ * order is now the projection's, which runs the scheduler's rules and is tested
+ * against the scheduler itself; this file checks the drawing.
  */
 
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { QueueTimelineView } from '../../components/QueueTimelineView';
-import type { PrintQueueItem, Printer } from '../../api/client';
+import type { PrintQueueItem, Printer, QueueProjectionEntry } from '../../api/client';
 
-const HOUR = 3600;
+const HOUR_MS = 3600 * 1000;
 
-const printers = [{ id: 1, name: 'Workshop X1C', model: 'X1C' }] as unknown as Printer[];
+const printers = [
+  { id: 1, name: 'Workshop X1C', model: 'X1C' },
+  { id: 2, name: 'Garage P1S', model: 'P1S' },
+] as unknown as Printer[];
 
-// Something has to be running for a lane to forecast at all: an idle printer's
-// ASAP queue has no committed anchor to chain from, so the view drops it.
 const running = {
   id: 100,
   printer_id: 1,
   status: 'printing',
   position: 0,
   archive_name: 'Running now',
-  print_time_seconds: HOUR,
+  print_time_seconds: 3600,
   started_at: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
 } as unknown as PrintQueueItem;
 
-const pending = (
-  id: number,
-  name: string,
-  position: number,
-  printTimeSeconds: number,
-  over: Partial<PrintQueueItem> = {},
-) =>
+const pending = (id: number, name: string, over: Partial<PrintQueueItem> = {}) =>
   ({
     id,
-    printer_id: 1,
+    printer_id: null,
+    target_model: 'P1S',
     status: 'pending',
-    position,
+    position: id,
     archive_name: name,
-    print_time_seconds: printTimeSeconds,
+    print_time_seconds: 3600,
     scheduled_time: null,
     manual_start: false,
     waiting_reason: null,
     ...over,
   }) as unknown as PrintQueueItem;
 
-const queueItems = [
-  running,
-  pending(1, 'Long job', 1, 2 * HOUR),
-  pending(2, 'Short job', 2, HOUR / 2),
-  pending(3, 'Medium job', 3, HOUR),
-];
+const at = (hoursFromNow: number) => new Date(Date.now() + hoursFromNow * HOUR_MS).toISOString();
 
-function renderTimeline(sjfEnabled: boolean) {
+function renderTimeline(items: PrintQueueItem[], projection: QueueProjectionEntry[]) {
   render(
     <QueueTimelineView
-      queueItems={queueItems}
+      queueItems={items}
       printers={printers}
       printerStatuses={{ 1: { progress: 50, remaining_time: 30, state: 'RUNNING' } }}
-      sjfEnabled={sjfEnabled}
+      projection={projection}
       onItemClick={() => {}}
       t={(key: string) => key}
     />,
   );
 }
 
-/** Bar names, left to right. Bars are absolutely positioned, so the rendered
- *  offset is what the user reads -- not DOM order. The tooltip leads with the
- *  display name, which is cleaner to match on than the bar's own text (name
- *  and duration sit in adjacent divs with no separator between them). */
+/** Bar names in one lane, left to right. Bars are absolutely positioned, so the
+ *  rendered offset is what the user reads, not DOM order. */
 function barsLeftToRight(): string[] {
   return screen
     .getAllByRole('button')
-    .filter(el => el.style.left.endsWith('%'))
+    .filter((el) => el.style.left.endsWith('%'))
     .sort((a, b) => parseFloat(a.style.left) - parseFloat(b.style.left))
-    .map(el => (el.getAttribute('title') ?? '').split(' \u00b7 ')[0]);
+    .map((el) => (el.getAttribute('title') ?? '').split(' · ')[0]);
 }
 
-describe('QueueTimelineView job ordering', () => {
-  it('chains by queue position when SJF is off', () => {
-    renderTimeline(false);
-    expect(barsLeftToRight()).toEqual(['Running now', 'Long job', 'Short job', 'Medium job']);
-  });
-
-  it('chains shortest-first when SJF is on', () => {
-    renderTimeline(true);
-    expect(barsLeftToRight()).toEqual(['Running now', 'Short job', 'Medium job', 'Long job']);
-  });
-
-  it('keeps a jumped item ahead of a shorter one', () => {
-    // The starvation guard is part of the scheduler's order too, so the
-    // timeline has to draw it or it lies about the long job that is finally
-    // about to run.
-    render(
-      <QueueTimelineView
-        queueItems={[
-          running,
-          pending(1, 'Short job', 1, HOUR / 2),
-          pending(2, 'Long job', 2, 2 * HOUR, { been_jumped: true }),
-        ]}
-        printers={printers}
-        printerStatuses={{ 1: { progress: 50, remaining_time: 30, state: 'RUNNING' } }}
-        sjfEnabled
-        onItemClick={() => {}}
-        t={(key: string) => key}
-      />,
+describe('QueueTimelineView', () => {
+  it('draws pending jobs at their projected start, in that order', () => {
+    renderTimeline(
+      [running, pending(1, 'Later job'), pending(2, 'Sooner job')],
+      [
+        { item_id: 1, printer_id: 2, start: at(3), end: at(4) },
+        { item_id: 2, printer_id: 2, start: at(1), end: at(2) },
+      ],
     );
-    // Position order would put the short job first, so this only passes if
-    // been_jumped is actually consulted.
-    expect(barsLeftToRight()).toEqual(['Running now', 'Long job', 'Short job']);
-  });
-});
-
-describe('QueueTimelineView and the scheduler waiting reasons (#3074)', () => {
-  /** The scheduler now puts a reason on a pinned item too, and the commonest
-   *  one by far -- "Busy: <printer>" -- describes the very chain this view
-   *  forecasts. Dropping every item that has a reason would empty the timeline
-   *  for anyone whose queue is pinned to specific printers. */
-  function renderWith(items: PrintQueueItem[]) {
-    render(
-      <QueueTimelineView
-        queueItems={items}
-        printers={printers}
-        printerStatuses={{ 1: { progress: 50, remaining_time: 30, state: 'RUNNING' } }}
-        sjfEnabled={false}
-        onItemClick={() => {}}
-        t={(key: string) => key}
-      />,
-    );
-  }
-
-  it('still forecasts an item that is only waiting its turn', () => {
-    renderWith([
-      running,
-      pending(1, 'Long job', 1, 2 * HOUR, { waiting_reason: 'Busy: X1C-01' }),
-      pending(2, 'Medium job', 2, HOUR, { waiting_reason: 'Busy: X1C-01' }),
-    ]);
-    expect(barsLeftToRight()).toEqual(['Running now', 'Long job', 'Medium job']);
+    expect(barsLeftToRight()).toEqual(['Running now', 'Sooner job', 'Later job']);
   });
 
-  it('still forecasts one held behind a drying cycle', () => {
-    renderWith([running, pending(1, 'Long job', 1, 2 * HOUR, { waiting_reason: 'Busy: X1C-01 (drying)' })]);
-    expect(barsLeftToRight()).toEqual(['Running now', 'Long job']);
+  it('draws an "Any model" job on the printer it is projected to take', () => {
+    renderTimeline([pending(1, 'Any P1S job')], [{ item_id: 1, printer_id: 2, start: at(1), end: at(2) }]);
+    const bar = screen.getByTitle(/^Any P1S job/);
+    expect(bar.closest('[data-lane]')?.getAttribute('data-lane')).toBe('printer:2');
   });
 
-  it('drops one that is waiting for the user', () => {
-    // These do not start on their own, so a bar would be a promise the queue
-    // cannot keep.
-    for (const reason of [
-      'Waiting for plate confirmation: X1C-01',
-      'Offline, no Auto On smart plug: X1C-01',
-      'Waiting on Enclosure Door',
-      'Waiting for filament: X1C-01 (needs PETG)',
-    ]) {
-      const { unmount } = render(
-        <QueueTimelineView
-          queueItems={[running, pending(1, 'Long job', 1, 2 * HOUR, { waiting_reason: reason })]}
-          printers={printers}
-          printerStatuses={{ 1: { progress: 50, remaining_time: 30, state: 'RUNNING' } }}
-          sjfEnabled={false}
-          onItemClick={() => {}}
-          t={(key: string) => key}
-        />,
-      );
-      expect(barsLeftToRight()).toEqual(['Running now']);
-      unmount();
-    }
+  it('leaves out a pending job the projection could not place', () => {
+    renderTimeline([running, pending(1, 'Staged job', { manual_start: true })], []);
+    expect(barsLeftToRight()).toEqual(['Running now']);
   });
 });
