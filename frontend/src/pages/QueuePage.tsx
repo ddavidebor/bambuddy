@@ -2255,8 +2255,9 @@ export function QueuePage() {
       compareQueueOrder(a, b, settings?.queue_shortest_first ?? false);
 
     // Claimants for each printer, in the order the scheduler would take them.
-    // Staged and future-scheduled items are excluded: the scheduler skips both
-    // without marking the printer busy, so neither holds up the item behind it.
+    // Staged and future-scheduled items are excluded: neither is next. A
+    // future-scheduled one can still hold its printer against a job that would
+    // overrun its time; this estimate does not model that.
     const contenders = new Map<number, PrintQueueItem[]>();
     queue
       .filter(

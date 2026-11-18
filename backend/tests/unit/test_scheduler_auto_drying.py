@@ -11,6 +11,7 @@ Covers:
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -436,6 +437,68 @@ class TestPlateHoldDoesNotGateDrying:
         await scheduler._check_auto_drying(self._db(), [], {1})
 
         assert not mock_pm.send_drying_command.called
+
+
+class TestBlockModeKeepsScheduledJobsOnTime:
+    """With drying set to block the queue, a cycle is not started when it would
+    still run at the printer's next scheduled job: the job would start late by
+    the rest of the cycle."""
+
+    @pytest.fixture
+    def scheduler(self):
+        return PrintScheduler()
+
+    @staticmethod
+    def _db():
+        db = AsyncMock()
+        db.execute = AsyncMock(
+            side_effect=TestAmbientDrying._make_db_side_effect(
+                {
+                    "queue_drying_enabled": TestAmbientDrying._make_setting("true"),
+                    "ambient_drying_enabled": TestAmbientDrying._make_setting("false"),
+                    "print_drying_enabled": TestAmbientDrying._make_setting("false"),
+                    "ams_humidity_fair": TestAmbientDrying._make_setting("60"),
+                    "queue_drying_block": TestAmbientDrying._make_setting("true"),
+                    "drying_presets": None,
+                }
+            )
+        )
+        return db
+
+    @staticmethod
+    def _scheduled_in(hours):
+        return SimpleNamespace(
+            printer_id=1,
+            target_model=None,
+            variants=[],
+            manual_start=False,
+            created_by_id=None,
+            scheduled_time=(datetime.now(timezone.utc) + timedelta(hours=hours)).replace(tzinfo=None),
+        )
+
+    async def _run(self, mock_pm, scheduler, item):
+        mock_pm.get_status.return_value = TestPlateHoldDoesNotGateDrying._finished_printer_state()
+        mock_pm.is_connected.return_value = True
+        mock_pm.get_model.return_value = "P2S"
+        mock_pm.send_drying_command.return_value = True
+        scheduler._is_printer_idle = MagicMock(return_value=True)
+        await scheduler._check_auto_drying(self._db(), [item], set())
+
+    @pytest.mark.asyncio
+    @patch("backend.app.services.print_scheduler.printer_manager")
+    @patch("backend.app.services.print_scheduler.supports_drying", return_value=True)
+    async def test_a_cycle_that_would_run_past_the_job_is_not_started(self, mock_sd, mock_pm, scheduler):
+        await self._run(mock_pm, scheduler, self._scheduled_in(2))  # the PLA preset dries for 12 h
+
+        assert not mock_pm.send_drying_command.called
+
+    @pytest.mark.asyncio
+    @patch("backend.app.services.print_scheduler.printer_manager")
+    @patch("backend.app.services.print_scheduler.supports_drying", return_value=True)
+    async def test_a_cycle_that_ends_in_time_still_pre_dries(self, mock_sd, mock_pm, scheduler):
+        await self._run(mock_pm, scheduler, self._scheduled_in(13))
+
+        mock_pm.send_drying_command.assert_called_once_with(1, 0, 45, 12, mode=1, filament="PLA")
 
 
 class TestStopDrying:

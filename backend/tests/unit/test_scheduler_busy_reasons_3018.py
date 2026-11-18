@@ -64,7 +64,9 @@ async def one_printer(tmp_path):
         printer_id = printer.id
         await db.commit()
 
-    async def add_item(*, scheduled_in: timedelta | None = None, status: str = "pending", position: int = 0):
+    async def add_item(
+        *, scheduled_in: timedelta | None = None, status: str = "pending", position: int = 0, print_time: int = 120
+    ):
         async with session_maker() as db:
             archive_rel = Path("archives") / f"job-{position}.3mf"
             (base_dir / archive_rel).write_bytes(b"archive payload")
@@ -84,6 +86,7 @@ async def one_printer(tmp_path):
                 status=status,
                 position=position,
                 scheduled_time=(datetime.now(timezone.utc) + scheduled_in) if scheduled_in else None,
+                print_time_seconds=print_time,
             )
             db.add(item)
             await db.commit()
@@ -187,12 +190,9 @@ class TestAPrinterTheQueueIsUsing:
 
     @pytest.mark.asyncio
     async def test_the_scheduled_item_stays_behind_and_the_other_goes(self, one_printer, caplog):
-        """The behaviour #3018 reported as the bug. It is the intended one.
-
-        A print scheduled for later does not hold the printer until then -- it is
-        skipped as 'scheduled_future' while an unscheduled item uses the idle
-        printer. Pinned here because the report turned on the label, not on this.
-        """
+        """A print scheduled for later waits for its time, and a job that finishes
+        before then uses the idle printer meanwhile. Pinned here because #3018's
+        report turned on the label, not on this."""
         scheduled_id = await one_printer.add_item(scheduled_in=timedelta(hours=6), position=0)
         queued_id = await one_printer.add_item(position=1)
 
@@ -251,3 +251,34 @@ class TestAPrinterThatCannotTakeWork:
                 await scheduler.check_queue()
 
         assert len(_printer_lines(caplog)) == 1
+
+
+class TestAScheduledItemHoldsItsPrinter:
+    """Nothing starts on the printer that would still be running at its time."""
+
+    @pytest.mark.asyncio
+    async def test_a_job_that_would_overrun_its_time_waits(self, one_printer, caplog):
+        scheduled_id = await one_printer.add_item(scheduled_in=timedelta(hours=1), position=1)
+        long_id = await one_printer.add_item(position=0, print_time=3 * 3600)
+
+        with caplog.at_level(logging.INFO, logger=SCHEDULER_LOGGER):
+            async with _scheduler(one_printer, idle=True) as scheduler:
+                await scheduler.check_queue()
+
+        async with one_printer.session_maker() as db:
+            assert (await db.get(PrintQueueItem, scheduled_id)).status == "pending"
+            long_item = await db.get(PrintQueueItem, long_id)
+            assert long_item.status == "pending"
+            assert long_item.waiting_reason.endswith("(held for a scheduled job)")
+        assert any("'reserved_for_scheduled': 1" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_job_with_no_estimate_is_taken_to_overrun(self, one_printer):
+        await one_printer.add_item(scheduled_in=timedelta(hours=6), position=1)
+        unknown_id = await one_printer.add_item(position=0, print_time=None)
+
+        async with _scheduler(one_printer, idle=True) as scheduler:
+            await scheduler.check_queue()
+
+        async with one_printer.session_maker() as db:
+            assert (await db.get(PrintQueueItem, unknown_id)).status == "pending"

@@ -263,6 +263,35 @@ _TERMINAL_STATE_QUEUE_STATUS = {
 }
 
 
+# A job with no print-time estimate is taken to run this long when deciding
+# whether it would still be printing at a scheduled job's time: long enough
+# that it never slips in front of one, short enough not to hold a printer for a
+# job scheduled days out.
+UNKNOWN_PRINT_TIME_FOR_RESERVATION = timedelta(hours=24)
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    """A stored naive-UTC datetime as an aware one."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _runs_into_reservation(item, upcoming: list[datetime], now: datetime) -> bool:
+    """Whether starting *item* now would still be running at one of *upcoming*.
+
+    *upcoming* are the start times of jobs scheduled on the printer. The earlier
+    schedule wins: a scheduled job is held only by one scheduled before it, so
+    two whose times overlap cannot hold each other off.
+    """
+    if not upcoming:
+        return False
+    seconds = item.print_time_seconds
+    end = now + (timedelta(seconds=seconds) if seconds else UNKNOWN_PRINT_TIME_FOR_RESERVATION)
+    own = _aware_utc(item.scheduled_time)
+    return any(now < t < end and (own is None or t < own) for t in upcoming)
+
+
 def _terminal_queue_status(state) -> str | None:
     """Queue status implied by *state*, or None if the print is not over.
 
@@ -1950,6 +1979,41 @@ class PrintScheduler:
             if stale:
                 await db.commit()
 
+            # Scheduled jobs. One whose time has come goes ahead of every job
+            # without one, earliest time first: it was promised a start time,
+            # and a printer that was busy then must not hand it to whatever sits
+            # higher in the list once it frees. The sort is stable, so the
+            # order above holds within each group.
+            now_utc = datetime.now(timezone.utc)
+
+            def _due_scheduled(it: PrintQueueItem) -> bool:
+                sched = _aware_utc(it.scheduled_time)
+                return sched is not None and sched <= now_utc and not it.manual_start
+
+            items.sort(key=lambda it: (0, _aware_utc(it.scheduled_time)) if _due_scheduled(it) else (1,))
+
+            # One whose time has not come holds its printer: nothing starts there
+            # that would still be running at that time (see
+            # _runs_into_reservation). It used to be skipped and nothing more,
+            # so the job behind it took the printer and the scheduled one
+            # started when that print ended, hours late. Only jobs pinned to a
+            # printer reserve it; an "Any <model>" job gets the ordering above.
+            reservations: dict[int, list[datetime]] = {}
+            for it in items:
+                sched = _aware_utc(it.scheduled_time)
+                if (
+                    it.printer_id is not None
+                    and not (it.target_model or it.variants)
+                    and not it.manual_start
+                    and sched is not None
+                    and sched > now_utc
+                ):
+                    reservations.setdefault(it.printer_id, []).append(sched)
+
+            def reserved_against(it: PrintQueueItem) -> set[int]:
+                """Printers *it* may not start on now, for a scheduled job there."""
+                return {pid for pid, times in reservations.items() if _runs_into_reservation(it, times, now_utc)}
+
             # Read plate-clear setting once per queue check. Default MUST be
             # False to match the schema (SettingsSchema.require_plate_clear
             # defaults False) and the frontend (toggle + card badge both treat a
@@ -2297,11 +2361,9 @@ class PrintScheduler:
 
             for item in items:
                 # Check scheduled time first (scheduled_time is stored in UTC from ISO string)
-                if item.scheduled_time:
-                    sched = item.scheduled_time
-                    if sched.tzinfo is None:
-                        sched = sched.replace(tzinfo=timezone.utc)
-                    if sched > datetime.now(timezone.utc):
+                sched = _aware_utc(item.scheduled_time)
+                if sched is not None:
+                    if sched > now_utc:
                         # Waiting on the clock, not on a printer.
                         await hold_item(item, None)
                         skip_reasons["scheduled_future"] = skip_reasons.get("scheduled_future", 0) + 1
@@ -2391,6 +2453,15 @@ class PrintScheduler:
                             item_hold_reasons.get(item.printer_id) or f"Busy: {printer_label(item.printer_id)}",
                             notify=item.printer_id not in backoff_printers,
                         )
+                        continue
+
+                    # Held for a job scheduled on it. Not marked busy: a shorter
+                    # job further down may still fit before that time.
+                    if item.printer_id in reserved_against(item):
+                        await hold_item(
+                            item, f"Busy: {printer_label(item.printer_id)} (held for a scheduled job)", notify=False
+                        )
+                        skip_reasons["reserved_for_scheduled"] = skip_reasons.get("reserved_for_scheduled", 0) + 1
                         continue
 
                     # Check if printer is idle
@@ -2624,6 +2695,7 @@ class PrintScheduler:
                     # than one printer is free in the same pass.
                     candidates = _candidates_for(item)
                     item_scope = await _creator_scope(item.created_by_id)
+                    item_reserved = reserved_against(item)
                     printer_id = None
                     chosen: _ModelCandidate | None = None
                     per_model_reasons: list[tuple[str | None, str]] = []
@@ -2705,7 +2777,7 @@ class PrintScheduler:
                                 # Sensor-held printers are unavailable to the
                                 # matcher but stay out of busy_printers itself
                                 # (#1148) — see where `interlocked` is built.
-                                busy_printers | interlocked.keys() | gate_blocked | drying_held,
+                                busy_printers | interlocked.keys() | gate_blocked | drying_held | item_reserved,
                                 effective_types,
                                 item.target_location,
                                 filament_overrides=filament_overrides,
@@ -2744,7 +2816,7 @@ class PrintScheduler:
                             db,
                             wakeable_candidates,
                             item.target_location,
-                            busy_printers | interlocked.keys(),
+                            busy_printers | interlocked.keys() | item_reserved,
                             wakeable_printer_ids,
                             require_plate_clear,
                             printer_scope=item_scope,
@@ -6970,6 +7042,9 @@ class PrintScheduler:
         # a new cycle off. A job waiting for its start time is what queue
         # drying dries ahead of.
         printers_with_ready_items: set[int] = set()
+        # The earliest time a job is scheduled for on each printer, for block
+        # mode: a cycle that would still run then holds that job.
+        next_scheduled: dict[int, datetime] = {}
         now_utc = datetime.now(timezone.utc)
         creator_scopes: dict[int | None, PrinterScope] = {}
         model_printers: dict[tuple[str, str | None, int | None], set[int]] = {}
@@ -6991,6 +7066,10 @@ class PrintScheduler:
                 sched = sched.replace(tzinfo=timezone.utc)
             if sched is None or sched <= now_utc:
                 printers_with_ready_items |= item_printers
+            elif not item.manual_start:
+                for pid in item_printers:
+                    if pid not in next_scheduled or sched < next_scheduled[pid]:
+                        next_scheduled[pid] = sched
 
         # If only queue mode is on and no printers have scheduled items, stop drying
         # (but skip this short-circuit when print_drying_enabled is on — busy printers
@@ -7416,6 +7495,26 @@ class PrintScheduler:
                 # ineffective and firmware will reject anyway.
                 if mid_print:
                     temp = max(40, temp - 5)
+
+                # Block mode holds a job while its printer dries, so a cycle
+                # that would outlast the next scheduled job's time would start
+                # that job late by the rest of the cycle: an 8 h dry begun at
+                # 13:58 for a 14:00 job started it at 22:00.
+                due_at = next_scheduled.get(pid)
+                if (
+                    block_for_drying
+                    and not mid_print
+                    and due_at is not None
+                    and now_utc + timedelta(hours=duration_hours) > due_at
+                ):
+                    logger.debug(
+                        "Auto-drying: printer %d AMS %d skipped — a %dh cycle would run past a job scheduled at %s",
+                        pid,
+                        ams_id,
+                        duration_hours,
+                        due_at.isoformat(),
+                    )
+                    continue
 
                 # Start drying
                 logger.info(

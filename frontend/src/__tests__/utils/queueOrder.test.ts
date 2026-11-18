@@ -16,6 +16,8 @@ interface Item {
   been_jumped?: boolean;
   print_time_seconds?: number | null;
   position: number;
+  scheduled_time?: string | null;
+  manual_start?: boolean;
 }
 
 const item = (id: number, over: Partial<Item> = {}): Item => ({
@@ -128,5 +130,30 @@ describe('compareQueueOrder across printers and models (#3200)', () => {
       item(5, { printer_id: 1, position: 1 }),
     ];
     expect(idsInOrder(items, false)).toEqual([5, 7]);
+  });
+});
+
+describe('compareQueueOrder with scheduled jobs', () => {
+  const now = Date.parse('2026-03-02T12:00:00Z');
+  const order = (items: Item[], sjf = false) =>
+    [...items].sort((a, b) => compareQueueOrder(a, b, sjf, now)).map(i => i.id);
+
+  it('puts a scheduled job whose time has come ahead of the rest, earliest first', () => {
+    const items = [
+      item(1, { position: 1 }),
+      item(2, { position: 2, scheduled_time: '2026-03-02T11:30:00Z' }),
+      item(3, { position: 3, scheduled_time: '2026-03-02T11:00:00Z' }),
+    ];
+    expect(order(items)).toEqual([3, 2, 1]);
+    expect(order(items, true)).toEqual([3, 2, 1]);
+  });
+
+  it('leaves a job scheduled for later, or staged, where it is', () => {
+    const items = [
+      item(1, { position: 1 }),
+      item(2, { position: 2, scheduled_time: '2026-03-02T13:00:00Z' }),
+      item(3, { position: 3, scheduled_time: '2026-03-02T11:00:00Z', manual_start: true }),
+    ];
+    expect(order(items)).toEqual([1, 2, 3]);
   });
 });

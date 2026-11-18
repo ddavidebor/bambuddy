@@ -149,13 +149,23 @@ class _Rules:
     def due(self, job: _Job) -> bool:
         return not job.manual_start and (job.scheduled is None or job.scheduled <= self.clock.now)
 
+    def rank(self, job: _Job) -> tuple:
+        """Queue order, except that a scheduled job whose time has come goes first."""
+        if self.scheduled_rule and job.scheduled is not None and self.due(job):
+            return (0, job.scheduled, job.order)
+        return (1, job.order)
+
     def may_take(self, job: _Job, pid: int) -> bool:
         if job.target_model is not None:
             return self.printers[pid].model == job.target_model
         return job.printer_id == pid
 
     def reserved_against(self, job: _Job, pid: int) -> bool:
-        """Starting *job* on *pid* would run into a scheduled job's time there."""
+        """Starting *job* on *pid* would run into a scheduled job's time there.
+
+        The earlier schedule wins, so a job is only held by one scheduled
+        before its own time.
+        """
         if not self.scheduled_rule:
             return False
         end = self.clock.now + job.duration
@@ -166,6 +176,7 @@ class _Rules:
             and not other.manual_start
             and other.scheduled is not None
             and self.clock.now < other.scheduled < end
+            and (job.scheduled is None or other.scheduled < job.scheduled)
             for other in self.jobs
         )
 
@@ -193,7 +204,7 @@ class _Rules:
             ahead = [
                 other.id
                 for other in self.jobs
-                if other.order < job.order and other.id not in dispatched and self.runnable(other, pid)
+                if self.rank(other) < self.rank(job) and other.id not in dispatched and self.runnable(other, pid)
             ]
             if ahead:
                 self.violations.append(f"{now} job {job_id} took printer {pid} ahead of {ahead}")
@@ -421,9 +432,5 @@ async def test_queue_rules_hold_without_schedules():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="a scheduled job does not hold its printer: a job that overruns its time starts first",
-)
 async def test_queue_rules_hold_with_scheduled_jobs():
     await _check_seeds(scheduled=True)
