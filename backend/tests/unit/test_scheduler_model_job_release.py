@@ -14,66 +14,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-import backend.app.models  # noqa: F401 - populate Base.metadata
-from backend.app.core.database import Base
-from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.models.printer import Printer
 from backend.app.services.print_scheduler import PrintScheduler
+from backend.tests.scheduler_helpers import add_job as _add, two_p2s_printers
 
 
 @pytest.fixture
 async def ctx():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
-
-    async with session_maker() as db:
-        for pid in (1, 2):
-            db.add(
-                Printer(
-                    id=pid,
-                    name=f"P2S-0{pid}",
-                    serial_number=f"P2S000{pid}",
-                    ip_address=f"10.0.0.{pid}",
-                    access_code="x",
-                    model="P2S",
-                    is_active=True,
-                )
-            )
-        await db.commit()
-
-    try:
-        yield SimpleNamespace(session_maker=session_maker)
-    finally:
-        await engine.dispose()
-
-
-async def _add(ctx, *, printer_id=None, target_model=None, manual_start=False):
-    async with ctx.session_maker() as db:
-        lib = LibraryFile(
-            filename="job.gcode.3mf",
-            file_path="/library/job.gcode.3mf",
-            file_size=10,
-            file_type="gcode.3mf",
-            file_metadata={"sliced_for_model": "P2S"},
-        )
-        db.add(lib)
-        await db.flush()
-        item = PrintQueueItem(
-            status="pending",
-            position=1,
-            printer_id=printer_id,
-            target_model=target_model,
-            library_file_id=lib.id,
-            manual_start=manual_start,
-        )
-        db.add(item)
-        await db.commit()
-        return item.id
+    async with two_p2s_printers() as ctx:
+        yield ctx
 
 
 async def _printer_of(ctx, item_id):

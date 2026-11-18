@@ -1868,18 +1868,12 @@ class PrintScheduler:
                 items = [it for it in items if it.id not in inflight_ids]
 
             # An "Any <model>" job holds a printer only for the pass that picked
-            # it. The API refuses printer_id together with a target model, so a
-            # pending row carrying both was assigned by an earlier pass whose
-            # dispatch never happened: the upload pool was full, the printer
-            # turned busy before the upload, it went back to idle. Left in place,
-            # the pinned branch below took it for a pinned job and it waited on
-            # that one printer while others of the model stood idle.
-            #
-            # Two kinds keep their printer. A staged job (manual_start) is held
-            # there on purpose, by the filament checks that move it themselves
-            # (#3137). And a job sent to the printer that has not started yet
-            # (the start watchdog put it back): that printer may still start the
-            # file late, and sending it elsewhere would print it twice.
+            # it. The API refuses printer_id with a target model, so a pending row
+            # with both was picked by an earlier pass that never dispatched it
+            # (upload pool full, printer turned busy); left alone, the pinned
+            # branch below would keep it waiting on that one printer. Kept: staged
+            # jobs, which the filament holds move themselves (#3137), and jobs
+            # whose file the printer has and may still start late.
             stale = [
                 it
                 for it in items
@@ -1889,12 +1883,10 @@ class PrintScheduler:
                 and it.id not in self._sent_unstarted_print
             ]
             for it in stale:
-                logger.info(
-                    "Queue item %s: returning model job to the pool (was assigned to printer %s, never dispatched)",
-                    it.id,
-                    it.printer_id,
-                )
+                logger.info("Queue item %s: model job back to the pool from printer %s", it.id, it.printer_id)
                 it.printer_id = None
+                # The nozzle mapping stays: assignment drops it where it is per printer.
+                drop_printer_resolved(it, keep=("nozzle_mapping",))
             if stale:
                 await db.commit()
 
@@ -2349,66 +2341,32 @@ class PrintScheduler:
                     if not printer_connected:
                         plugs = await self._get_smart_plugs(db, item.printer_id)
                         auto_on_plugs = self._auto_on_plugs(plugs)
-                        # A power-on blocks this whole pass for up to
-                        # `_power_on_wait_time`, so the rules the model branch
-                        # follows apply here too (#2786): one power-on per pass,
-                        # and a printer that did not come up waits out its
-                        # cool-off. Without them, one printer that never answers
-                        # cost every pass three minutes, and every other printer's
-                        # jobs, scheduled ones included, started that much later.
-                        if auto_on_plugs and self._wake_recently_failed(item.printer_id):
-                            await hold_for_printer(
-                                item,
-                                item.printer_id,
-                                "smart-plug power-on failed recently; cooling off",
-                                f"Offline: {printer_label(item.printer_id)} — the smart plug could not power it on",
-                            )
-                            continue
-                        if auto_on_plugs and power_on_attempted:
-                            # Busy-shaped, like drying: it is its turn that it waits
-                            # for, and a reason that asked for something here would
-                            # swallow the notification if the power-on then fails.
-                            await hold_for_printer(
-                                item,
-                                item.printer_id,
-                                "offline; another printer is being powered on this pass",
-                                f"Busy: {printer_label(item.printer_id)} (offline, powered on next)",
-                            )
-                            continue
+                        # One power-on per pass and a cool-off after a failure,
+                        # as for model jobs (#2786): each one blocks the pass for
+                        # the boot wait, and every other printer's jobs with it.
                         if auto_on_plugs:
+                            if self._wake_recently_failed(item.printer_id):
+                                await hold_for_printer(
+                                    item,
+                                    item.printer_id,
+                                    "smart-plug power-on failed recently; cooling off",
+                                    f"Offline: {printer_label(item.printer_id)} — the smart plug could not power it on",
+                                )
+                                continue
+                            if power_on_attempted:
+                                # Busy-shaped, like drying: a reason that asked for
+                                # something here would swallow the notification if
+                                # the power-on then fails.
+                                await hold_for_printer(
+                                    item,
+                                    item.printer_id,
+                                    "offline; another printer is being powered on this pass",
+                                    f"Busy: {printer_label(item.printer_id)} (offline, powered on next)",
+                                )
+                                continue
                             power_on_attempted = True
                             logger.info("Printer %s offline, attempting to power on via smart plug(s)", item.printer_id)
-                            # Power on using the plug that actually feeds the printer, and
-                            # wait for it to boot on that one only (#2629).
-                            primary_plug = self._pick_power_plug(auto_on_plugs)
-                            powered_on = await self._power_on_and_wait(primary_plug, item.printer_id, db)
-                            if powered_on:
-                                # Also turn on any remaining auto_on plugs (e.g., filter)
-                                for extra_plug in [p for p in auto_on_plugs if p.id != primary_plug.id]:
-                                    try:
-                                        service = await smart_plug_manager.get_service_for_plug(extra_plug, db)
-                                        if await service.turn_on(extra_plug):
-                                            await publish_plug_state(
-                                                extra_plug.id,
-                                                extra_plug.name,
-                                                extra_plug.printer_id,
-                                                on=True,
-                                                ha_entity_id=extra_plug.ha_entity_id,
-                                            )
-                                        logger.info(
-                                            "Also powered on plug '%s' for printer %s", extra_plug.name, item.printer_id
-                                        )
-                                    except Exception as e:
-                                        logger.warning("Failed to power on extra plug '%s': %s", extra_plug.name, e)
-                                printer_connected = True
-                                printer_idle = self._is_printer_idle(item.printer_id, require_plate_clear)
-                            else:
-                                logger.warning(
-                                    "Could not power on printer %s via smart plug; not trying it again for %ss",
-                                    item.printer_id,
-                                    self._wake_failure_cooloff,
-                                )
-                                self._wake_failures[item.printer_id] = time.monotonic() + self._wake_failure_cooloff
+                            if not await self._power_on_printer(db, item.printer_id, auto_on_plugs):
                                 await hold_for_printer(
                                     item,
                                     item.printer_id,
@@ -2416,6 +2374,8 @@ class PrintScheduler:
                                     f"Offline: {printer_label(item.printer_id)} — the smart plug could not power it on",
                                 )
                                 continue
+                            printer_connected = True
+                            printer_idle = self._is_printer_idle(item.printer_id, require_plate_clear)
                         else:
                             # No plug or auto_on disabled. Worded exactly as the
                             # model-based branch words it (#2786): this is the one
@@ -3645,32 +3605,45 @@ class PrintScheduler:
                     candidate.target_model,
                     printer.id,
                 )
-                primary_plug = self._pick_power_plug(auto_on_plugs)
-                if not await self._power_on_and_wait(primary_plug, printer.id, db):
-                    logger.warning(
-                        "Could not power on printer %s via smart plug; not trying it again for %ss",
-                        printer.id,
-                        self._wake_failure_cooloff,
-                    )
-                    self._wake_failures[printer.id] = time.monotonic() + self._wake_failure_cooloff
+                if not await self._power_on_printer(db, printer.id, auto_on_plugs):
                     return None, printer.id
-
-                for extra_plug in [p for p in auto_on_plugs if p.id != primary_plug.id]:
-                    try:
-                        service = await smart_plug_manager.get_service_for_plug(extra_plug, db)
-                        if await service.turn_on(extra_plug):
-                            await publish_plug_state(
-                                extra_plug.id,
-                                extra_plug.name,
-                                extra_plug.printer_id,
-                                on=True,
-                                ha_entity_id=extra_plug.ha_entity_id,
-                            )
-                        logger.info("Also powered on plug '%s' for printer %s", extra_plug.name, printer.id)
-                    except Exception as e:
-                        logger.warning("Failed to power on extra plug '%s': %s", extra_plug.name, e)
                 return printer.id, printer.id
         return None, None
+
+    async def _power_on_printer(self, db: AsyncSession, printer_id: int, auto_on_plugs: list[SmartPlug]) -> bool:
+        """Power a printer on through its Auto On plugs and wait for it to connect.
+
+        Waits on the plug that feeds the printer only (#2629), then switches the
+        rest on (a filter, say). A printer that does not come up is not tried
+        again until its cool-off ends (#2786); callers check
+        ``_wake_recently_failed`` before calling. Blocks the queue pass for up to
+        ``_power_on_wait_time``.
+        """
+        primary_plug = self._pick_power_plug(auto_on_plugs)
+        if not await self._power_on_and_wait(primary_plug, printer_id, db):
+            logger.warning(
+                "Could not power on printer %s via smart plug; not trying it again for %ss",
+                printer_id,
+                self._wake_failure_cooloff,
+            )
+            self._wake_failures[printer_id] = time.monotonic() + self._wake_failure_cooloff
+            return False
+
+        for extra_plug in [p for p in auto_on_plugs if p.id != primary_plug.id]:
+            try:
+                service = await smart_plug_manager.get_service_for_plug(extra_plug, db)
+                if await service.turn_on(extra_plug):
+                    await publish_plug_state(
+                        extra_plug.id,
+                        extra_plug.name,
+                        extra_plug.printer_id,
+                        on=True,
+                        ha_entity_id=extra_plug.ha_entity_id,
+                    )
+                logger.info("Also powered on plug '%s' for printer %s", extra_plug.name, printer_id)
+            except Exception as e:
+                logger.warning("Failed to power on extra plug '%s': %s", extra_plug.name, e)
+        return True
 
     async def _find_idle_printer_for_model(
         self,

@@ -3827,44 +3827,23 @@ class TestMoveEndpoint:
     """
 
     @pytest.fixture
-    async def make_items(self, db_session):
-        from backend.app.models.archive import PrintArchive
+    async def make_items(self, db_session, printer_factory, archive_factory):
         from backend.app.models.print_queue import PrintQueueItem
-        from backend.app.models.printer import Printer
 
         async def _make(specs):
             printers = {}
-            items = []
+            ids = []
             for n, (printer_key, status) in enumerate(specs, start=1):
-                printer_id = None
-                if printer_key is not None:
-                    if printer_key not in printers:
-                        printer = Printer(
-                            name=f"Move {printer_key}",
-                            ip_address=f"192.168.7.{len(printers) + 1}",
-                            serial_number=f"MOVE{printer_key}",
-                            access_code="12345678",
-                            model="X1C",
-                        )
-                        db_session.add(printer)
-                        await db_session.flush()
-                        printers[printer_key] = printer.id
-                    printer_id = printers[printer_key]
-                archive = PrintArchive(
-                    filename=f"move_{n}.3mf",
-                    print_name=f"Move {n}",
-                    file_path=f"/tmp/move_{n}.3mf",  # nosec B108
-                    file_size=1024,
-                    content_hash=f"movehash{n:06d}",
-                    status="completed",
-                )
-                db_session.add(archive)
-                await db_session.flush()
+                if printer_key is not None and printer_key not in printers:
+                    printers[printer_key] = (await printer_factory(name=f"Move {printer_key}")).id
+                printer_id = printers.get(printer_key)
+                archive = await archive_factory(printer_id, print_name=f"Move {n}", with_run=False)
                 item = PrintQueueItem(printer_id=printer_id, archive_id=archive.id, status=status, position=n)
                 db_session.add(item)
-                items.append(item)
+                await db_session.flush()
+                ids.append(item.id)
             await db_session.commit()
-            return [item.id for item in items]
+            return ids
 
         return _make
 

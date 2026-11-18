@@ -1239,7 +1239,6 @@ interface QueueRowRenderProps {
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   onMoveBlock?: (movingIds: number[], anchorId: number, placeAfter: boolean) => void;
-  dragEnabled: boolean;
 }
 
 /** Renders either a single item or a collapsible batch group containing N
@@ -1261,7 +1260,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
     etaNow,
     onMoveUp,
     onMoveDown,
-    dragEnabled,
+    onMoveBlock,
   } = props;
 
   if (row.kind === 'item') {
@@ -1276,7 +1275,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
         onStart={() => startMutation.mutate({ id: row.item.id })}
         onMoveUp={onMoveUp}
         onMoveDown={onMoveDown}
-        dragEnabled={dragEnabled}
+        dragEnabled={!!onMoveBlock}
         timeFormat={timeFormat}
         isSelected={selectedItems.includes(row.item.id)}
         onToggleSelect={() => handleToggleSelect(row.item.id)}
@@ -1315,12 +1314,13 @@ function SortableBatchRow({
   onMoveUp,
   onMoveDown,
   onMoveBlock,
-  dragEnabled,
 }: QueueRowRenderProps) {
   // Dispatcher (QueueRowRender) only mounts this with row.kind === 'batch';
   // narrow up-front so the hook below can reference batchId unconditionally.
   const batchRow = row as Extract<QueueRow, { kind: 'batch' }>;
   const canReorder = hasPermission('queue:reorder');
+  // Only in the manual order, where the page passes a mover at all.
+  const canDrag = canReorder && !!onMoveBlock;
   const {
     attributes,
     listeners,
@@ -1328,7 +1328,7 @@ function SortableBatchRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: `batch-${batchRow.batchId}`, disabled: !canReorder || !dragEnabled });
+  } = useSortable({ id: `batch-${batchRow.batchId}`, disabled: !canDrag });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -1404,7 +1404,7 @@ function SortableBatchRow({
         >
           {allSelected && <Check className="w-4 h-4" />}
         </button>
-        {canReorder && dragEnabled && (
+        {canDrag && (
           <div
             {...attributes}
             {...listeners}
@@ -1498,7 +1498,7 @@ function SortableBatchRow({
                   ? () => onMoveBlock([child.id], batchRow.items[ci + 1].id, true)
                   : undefined
               }
-              dragEnabled={dragEnabled}
+              dragEnabled={!!onMoveBlock}
               timeFormat={timeFormat}
               isSelected={selectedItems.includes(child.id)}
               onToggleSelect={() => handleToggleSelect(child.id)}
@@ -2030,7 +2030,7 @@ export function QueuePage() {
     },
   });
 
-  const reorderMutation = useMutation({
+  const moveMutation = useMutation({
     mutationFn: ({ itemIds, anchorId, placeAfter }: { itemIds: number[]; anchorId: number; placeAfter: boolean }) =>
       api.moveQueueItems(itemIds, anchorId, placeAfter),
     onSuccess: () => {
@@ -2458,15 +2458,14 @@ export function QueuePage() {
     row.kind === 'item' ? [row.item.id] : row.items.map((i) => i.id);
 
   // Move a block of items to sit immediately before (or after) an anchor item
-  // in the global pending order. Drag and the arrows both end here. The server
-  // renumbers the whole queue: this page only sees the rows its filters and the
-  // user's scope let through, so numbering them itself collided with the rest.
+  // in the global pending order. Drag and the arrows both end here; the server
+  // renumbers the queue (see PrintQueueMove).
   const moveBlockRelativeTo = (
     movingIds: number[],
     anchorId: number,
     placeAfter: boolean,
   ) => {
-    reorderMutation.mutate({ itemIds: movingIds, anchorId, placeAfter });
+    moveMutation.mutate({ itemIds: movingIds, anchorId, placeAfter });
   };
 
   // Build up/down thunks for the row at `idx` within its displayed sibling
@@ -3120,7 +3119,6 @@ export function QueuePage() {
                           aggregateForRows={aggregateForRows}
                           {...rowMovers(groupedRows, idx)}
                           onMoveBlock={canReorderManually ? moveBlockRelativeTo : undefined}
-                          dragEnabled={canReorderManually}
                         />
                       ))}
                     </div>
@@ -3161,7 +3159,6 @@ export function QueuePage() {
                                   aggregateForRows={aggregateForRows}
                                   {...rowMovers(bucket.rows, idx)}
                                   onMoveBlock={canReorderManually ? moveBlockRelativeTo : undefined}
-                                  dragEnabled={canReorderManually}
                                 />
                               ))}
                             </div>

@@ -7,6 +7,8 @@ compete for a printer by position. A per-printer sequence gave each lane its
 own 1, 2, 3 and made a job added last land in the middle of the list.
 """
 
+from collections.abc import Callable
+
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,19 +48,38 @@ async def next_queue_position(db: AsyncSession) -> int:
 
 
 async def move_queue_items(
-    db: AsyncSession, pending: list[PrintQueueItem], item_ids: list[int], anchor_id: int, place_after: bool
-) -> None:
+    db: AsyncSession, item_ids: list[int], anchor_id: int, place_after: bool, visible: Callable[[PrintQueueItem], bool]
+) -> list[int] | None:
     """Move *item_ids* next to *anchor_id* and renumber every pending item 1..n.
 
-    *pending* is the whole pending queue in its current order, read under
-    ``lock_queue_positions``. The moved items keep their relative order. Only
-    rows whose position changes are written. The caller commits.
+    Renumbering the whole queue, not just the moved rows, is what keeps rows the
+    caller cannot see in their order with no two on one position. The moved
+    items keep their queue order. Returns the ids among *item_ids* and
+    *anchor_id* that are not pending or not *visible*, without moving anything,
+    or None once moved. The caller commits.
     """
+    await lock_queue_positions(db)
+    pending = list(
+        (
+            await db.execute(
+                select(PrintQueueItem)
+                .where(PrintQueueItem.status == "pending")
+                .order_by(PrintQueueItem.position, PrintQueueItem.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    reachable = {item.id for item in pending if visible(item)}
+    missing = [i for i in [*item_ids, anchor_id] if i not in reachable]
+    if missing:
+        return missing
+
     moving = set(item_ids)
     remaining = [item for item in pending if item.id not in moving]
     insert_at = next(i for i, item in enumerate(remaining) if item.id == anchor_id) + (1 if place_after else 0)
-    # Moved items keep the order they had in the queue, not the request's.
     moved = [item for item in pending if item.id in moving]
     for position, item in enumerate(remaining[:insert_at] + moved + remaining[insert_at:], start=1):
         if item.position != position:
             item.position = position
+    return None

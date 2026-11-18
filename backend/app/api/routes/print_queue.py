@@ -2776,30 +2776,12 @@ async def move_queue_items_route(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_UPDATE_ALL),
     printer_scope: PrinterScope = RequestPrinterScope,
 ):
-    """Move pending items before or after another pending item.
-
-    Renumbers the whole pending queue, including items the caller cannot see,
-    so their order relative to each other is kept and no two items share a
-    position.
-    """
-    await lock_queue_positions(db)
-    pending = list(
-        (
-            await db.execute(
-                select(PrintQueueItem)
-                .where(PrintQueueItem.status == "pending")
-                .order_by(PrintQueueItem.position, PrintQueueItem.id)
-            )
-        )
-        .scalars()
-        .all()
+    """Move pending items before or after another pending item; see ``move_queue_items``."""
+    missing = await move_queue_items(
+        db, data.item_ids, data.anchor_id, data.place_after, lambda item: printer_scope.allows(item.printer_id)
     )
-    visible = {item.id for item in pending if printer_scope.allows(item.printer_id)}
-    missing = [i for i in [*data.item_ids, data.anchor_id] if i not in visible]
     if missing:
         raise HTTPException(409, f"Not pending, or not in the queue: {missing}")
-
-    await move_queue_items(db, pending, data.item_ids, data.anchor_id, data.place_after)
     await db.commit()
     logger.info(
         "Moved queue items %s %s item %s",

@@ -83,17 +83,18 @@ export function ScheduleOptionsPanel({
     const parsedDate = parseDateInput(newDateValue, dateFormat as DateFormat);
     const parsedTime = parseTimeInput(newTimeValue);
 
-    if (parsedDate && parsedTime) {
-      parsedDate.setHours(parsedTime.hours, parsedTime.minutes, 0, 0);
-    }
+    const when =
+      parsedDate && parsedTime
+        ? new Date(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate(), parsedTime.hours, parsedTime.minutes)
+        : null;
     // A time that has already passed is as unusable as one that does not
     // parse. Both clear the value, which keeps the dialog from submitting: it
     // used to keep the last good value, so the job was queued for a time the
     // fields no longer showed.
-    const inFuture = !!parsedDate && !!parsedTime && parsedDate > new Date();
+    const scheduledTime = when && when > new Date() ? toDateTimeLocalValue(when) : '';
     setIsDateValid(!!parsedDate);
-    setIsTimeValid(!!parsedTime && (!parsedDate || inFuture));
-    onChange({ ...options, scheduledTime: inFuture ? toDateTimeLocalValue(parsedDate!) : '' });
+    setIsTimeValid(!!parsedTime && (!parsedDate || !!scheduledTime));
+    if (scheduledTime !== options.scheduledTime) onChange({ ...options, scheduledTime });
   };
 
   const handleDateChange = (value: string) => {

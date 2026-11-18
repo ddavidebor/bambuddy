@@ -384,10 +384,9 @@ class PrintQueueReorder(BaseModel):
 class PrintQueueMove(BaseModel):
     """Move pending items to sit before or after another pending item.
 
-    The queue page's drag and its up/down arrows send this rather than
-    positions: the page only sees the items its filters and the caller's scope
-    let through, so positions it numbered itself collided with the ones it
-    could not see. The server renumbers the whole pending queue instead.
+    What the queue page's drag and arrows send instead of positions: the page
+    sees only the rows its filters and the caller's scope let through, so
+    positions it numbered itself collided with the rows it could not see.
     """
 
     item_ids: list[int] = Field(min_length=1)
