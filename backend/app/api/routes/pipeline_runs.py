@@ -74,6 +74,7 @@ from backend.app.services.pipeline_eligibility import (
 from backend.app.services.print_confirmation import confirm_outcome_for_new_queue_item
 from backend.app.services.print_defaults import default_print_options
 from backend.app.services.queue_announcements import announce_queue_jobs_added
+from backend.app.services.queue_position import next_queue_position
 
 logger = logging.getLogger(__name__)
 
@@ -657,11 +658,15 @@ def _make_orchestration_callable(
             confirm_outcome = await confirm_outcome_for_new_queue_item(session)
             # Nor print options: the install's defaults.
             print_options = await default_print_options(session)
+            # The copies go to the end of the queue, in copy order. Left unset,
+            # position defaulted to 0 and they jumped every job already waiting.
+            position = await next_queue_position(session)
 
             for job, (printer_id, target_model) in zip(jobs, assignments, strict=False):
                 queue_item = PrintQueueItem(
                     printer_id=printer_id,
                     target_model=target_model,
+                    position=position,
                     library_file_id=slice_response.library_file_id,
                     # From the run as refreshed after the slice, not the id the
                     # request started with: a user deleted meanwhile is gone
@@ -684,6 +689,7 @@ def _make_orchestration_callable(
                 )
                 session.add(queue_item)
                 await session.flush()
+                position += 1
 
                 job.queue_entry_id = queue_item.id
                 job.assigned_printer_id = printer_id  # may be None for max_parallel
