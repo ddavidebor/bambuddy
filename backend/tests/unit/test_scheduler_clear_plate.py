@@ -451,6 +451,7 @@ class TestSchedulerQueueCheckLogging:
         mock_item.scheduled_time = None
         mock_item.manual_start = False
         mock_item.target_model = None
+        mock_item.variants = []
 
         mock_pm.is_connected.return_value = True
         mock_pm.get_status.return_value = MagicMock(state="RUNNING")

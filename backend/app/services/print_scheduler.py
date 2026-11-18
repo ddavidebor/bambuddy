@@ -1867,6 +1867,37 @@ class PrintScheduler:
                 inflight_ids = set(self._inflight)
                 items = [it for it in items if it.id not in inflight_ids]
 
+            # An "Any <model>" job holds a printer only for the pass that picked
+            # it. The API refuses printer_id together with a target model, so a
+            # pending row carrying both was assigned by an earlier pass whose
+            # dispatch never happened: the upload pool was full, the printer
+            # turned busy before the upload, it went back to idle. Left in place,
+            # the pinned branch below took it for a pinned job and it waited on
+            # that one printer while others of the model stood idle.
+            #
+            # Two kinds keep their printer. A staged job (manual_start) is held
+            # there on purpose, by the filament checks that move it themselves
+            # (#3137). And a job sent to the printer that has not started yet
+            # (the start watchdog put it back): that printer may still start the
+            # file late, and sending it elsewhere would print it twice.
+            stale = [
+                it
+                for it in items
+                if it.printer_id is not None
+                and (it.target_model or it.variants)
+                and not it.manual_start
+                and it.id not in self._sent_unstarted_print
+            ]
+            for it in stale:
+                logger.info(
+                    "Queue item %s: returning model job to the pool (was assigned to printer %s, never dispatched)",
+                    it.id,
+                    it.printer_id,
+                )
+                it.printer_id = None
+            if stale:
+                await db.commit()
+
             # Read plate-clear setting once per queue check. Default MUST be
             # False to match the schema (SettingsSchema.require_plate_clear
             # defaults False) and the frontend (toggle + card badge both treat a
