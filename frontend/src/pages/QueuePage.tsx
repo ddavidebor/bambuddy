@@ -570,6 +570,7 @@ function SortableQueueItem({
   onStart,
   onMoveUp,
   onMoveDown,
+  dragEnabled = true,
   timeFormat = 'system',
   isSelected = false,
   onToggleSelect,
@@ -593,6 +594,9 @@ function SortableQueueItem({
   // is unaffected. Move one step among siblings, then persist via reorder.
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  // False outside the manual order: a drag there would persist whatever the
+  // list happens to be sorted by as the queue order.
+  dragEnabled?: boolean;
   timeFormat?: TimeFormat;
   isSelected?: boolean;
   onToggleSelect?: () => void;
@@ -680,7 +684,7 @@ function SortableQueueItem({
     filamentNameByIdx,
   );
 
-  const canReorder = hasPermission('queue:reorder');
+  const canReorder = hasPermission('queue:reorder') && dragEnabled;
   const {
     attributes,
     listeners,
@@ -792,7 +796,7 @@ function SortableQueueItem({
         )}
 
         {/* Drag handle or position number - hidden on mobile */}
-        {isPending ? (
+        {isPending && canReorder ? (
           <div
             {...attributes}
             {...listeners}
@@ -1235,6 +1239,7 @@ interface QueueRowRenderProps {
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   onMoveBlock?: (movingIds: number[], anchorId: number, placeAfter: boolean) => void;
+  dragEnabled: boolean;
 }
 
 /** Renders either a single item or a collapsible batch group containing N
@@ -1256,6 +1261,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
     etaNow,
     onMoveUp,
     onMoveDown,
+    dragEnabled,
   } = props;
 
   if (row.kind === 'item') {
@@ -1270,6 +1276,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
         onStart={() => startMutation.mutate({ id: row.item.id })}
         onMoveUp={onMoveUp}
         onMoveDown={onMoveDown}
+        dragEnabled={dragEnabled}
         timeFormat={timeFormat}
         isSelected={selectedItems.includes(row.item.id)}
         onToggleSelect={() => handleToggleSelect(row.item.id)}
@@ -1308,6 +1315,7 @@ function SortableBatchRow({
   onMoveUp,
   onMoveDown,
   onMoveBlock,
+  dragEnabled,
 }: QueueRowRenderProps) {
   // Dispatcher (QueueRowRender) only mounts this with row.kind === 'batch';
   // narrow up-front so the hook below can reference batchId unconditionally.
@@ -1320,7 +1328,7 @@ function SortableBatchRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: `batch-${batchRow.batchId}`, disabled: !canReorder });
+  } = useSortable({ id: `batch-${batchRow.batchId}`, disabled: !canReorder || !dragEnabled });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -1396,7 +1404,7 @@ function SortableBatchRow({
         >
           {allSelected && <Check className="w-4 h-4" />}
         </button>
-        {canReorder && (
+        {canReorder && dragEnabled && (
           <div
             {...attributes}
             {...listeners}
@@ -1490,6 +1498,7 @@ function SortableBatchRow({
                   ? () => onMoveBlock([child.id], batchRow.items[ci + 1].id, true)
                   : undefined
               }
+              dragEnabled={dragEnabled}
               timeFormat={timeFormat}
               isSelected={selectedItems.includes(child.id)}
               onToggleSelect={() => handleToggleSelect(child.id)}
@@ -2022,7 +2031,8 @@ export function QueuePage() {
   });
 
   const reorderMutation = useMutation({
-    mutationFn: (items: { id: number; position: number }[]) => api.reorderQueue(items),
+    mutationFn: ({ itemIds, anchorId, placeAfter }: { itemIds: number[]; anchorId: number; placeAfter: boolean }) =>
+      api.moveQueueItems(itemIds, anchorId, placeAfter),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
     },
@@ -2373,7 +2383,7 @@ export function QueuePage() {
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     setActiveDragId(null);
-    if (!over || active.id === over.id) return;
+    if (!canReorderManually || !over || active.id === over.id) return;
 
     // Resolve dragged source → movingIds (preserving order from pendingItems).
     //   - `batch-<id>`: every child of that batch, in their current order
@@ -2396,41 +2406,20 @@ export function QueuePage() {
     }
     if (movingIds.length === 0) return;
 
-    // Resolve drop target → index inside pendingItems. A `batch-<id>` drop
-    // target anchors at the batch's first child, so dropping above another
-    // batch lands the moving block immediately before it.
-    let overIndex: number;
+    // The rows under the pointer: a whole batch, or one item.
     const overId = over.id;
-    if (typeof overId === 'string' && overId.startsWith('batch-')) {
-      const overBatchId = Number(overId.slice('batch-'.length));
-      overIndex = pendingItems.findIndex((i) => i.batch_id === overBatchId);
-    } else {
-      overIndex = pendingItems.findIndex((i) => i.id === overId);
-    }
-    if (overIndex === -1) return;
+    const overIds =
+      typeof overId === 'string' && overId.startsWith('batch-')
+        ? pendingItems.filter((i) => i.batch_id === Number(overId.slice('batch-'.length))).map((i) => i.id)
+        : [overId as number];
+    if (overIds.length === 0 || overIds.some((id) => movingIds.includes(id))) return;
 
-    // Remove the moving items, then re-insert at overIndex (adjusted).
-    const overAnchor = pendingItems[overIndex];
-    const remaining = pendingItems.filter((i) => !movingIds.includes(i.id));
-    let insertAt = remaining.findIndex((i) => i.id === overAnchor.id);
-    if (insertAt === -1) insertAt = overIndex;
-    // If dragging downward across the drop target, insert AFTER it; upward
-    // = before. dnd-kit's `over` is the row under the pointer, not the gap.
-    const firstMovingIndex = pendingItems.findIndex((i) => i.id === movingIds[0]);
-    if (firstMovingIndex < overIndex) insertAt += 1;
-    const reordered = [
-      ...remaining.slice(0, insertAt),
-      ...movingIds
-        .map((id) => pendingItems.find((i) => i.id === id))
-        .filter((x): x is PrintQueueItem => !!x),
-      ...remaining.slice(insertAt),
-    ];
-
-    const updates = reordered.map((item, index) => ({
-      id: item.id,
-      position: index + 1,
-    }));
-    reorderMutation.mutate(updates);
+    // dnd-kit's `over` is the row under the pointer, not the gap: dragging
+    // down lands after it, dragging up before it. A batch is passed over
+    // whole, never split.
+    const index = (id: number) => pendingItems.findIndex((i) => i.id === id);
+    const movingDown = index(movingIds[0]) < index(overIds[0]);
+    moveBlockRelativeTo(movingIds, movingDown ? overIds[overIds.length - 1] : overIds[0], movingDown);
   };
 
   // Group pending items by batch_id. Items with batch_id null render as
@@ -2471,30 +2460,15 @@ export function QueuePage() {
     row.kind === 'item' ? [row.item.id] : row.items.map((i) => i.id);
 
   // Move a block of items to sit immediately before (or after) an anchor item
-  // in the global pending order, then persist — the same remove-and-reinsert
-  // shape as handleDragEnd, so arrows and drag agree. Anchoring to a real item
-  // id keeps it correct in the printer-grouped layout, where a bucket's rows
-  // aren't contiguous in the global order.
+  // in the global pending order. Drag and the arrows both end here. The server
+  // renumbers the whole queue: this page only sees the rows its filters and the
+  // user's scope let through, so numbering them itself collided with the rest.
   const moveBlockRelativeTo = (
     movingIds: number[],
     anchorId: number,
     placeAfter: boolean,
   ) => {
-    const remaining = pendingItems.filter((i) => !movingIds.includes(i.id));
-    let insertAt = remaining.findIndex((i) => i.id === anchorId);
-    if (insertAt === -1) return;
-    if (placeAfter) insertAt += 1;
-    const movingItems = movingIds
-      .map((id) => pendingItems.find((i) => i.id === id))
-      .filter((x): x is PrintQueueItem => !!x);
-    const reordered = [
-      ...remaining.slice(0, insertAt),
-      ...movingItems,
-      ...remaining.slice(insertAt),
-    ];
-    reorderMutation.mutate(
-      reordered.map((item, index) => ({ id: item.id, position: index + 1 })),
-    );
+    reorderMutation.mutate({ itemIds: movingIds, anchorId, placeAfter });
   };
 
   // Build up/down thunks for the row at `idx` within its displayed sibling
@@ -3027,9 +3001,11 @@ export function QueuePage() {
                   <span className="text-xs sm:text-sm font-normal text-bambu-gray">
                     ({t('queue.itemCount', { count: pendingItems.length })})
                   </span>
-                  <span className="hidden sm:inline text-xs text-bambu-gray ml-2" title={t('queue.reorderHint')}>
-                    {t('queue.dragToReorder')}
-                  </span>
+                  {canReorderManually && (
+                    <span className="hidden sm:inline text-xs text-bambu-gray ml-2" title={t('queue.reorderHint')}>
+                      {t('queue.dragToReorder')}
+                    </span>
+                  )}
                 </h2>
                 <div className="flex items-center gap-2">
                   <select
@@ -3146,6 +3122,7 @@ export function QueuePage() {
                           aggregateForRows={aggregateForRows}
                           {...rowMovers(groupedRows, idx)}
                           onMoveBlock={canReorderManually ? moveBlockRelativeTo : undefined}
+                          dragEnabled={canReorderManually}
                         />
                       ))}
                     </div>
@@ -3186,6 +3163,7 @@ export function QueuePage() {
                                   aggregateForRows={aggregateForRows}
                                   {...rowMovers(bucket.rows, idx)}
                                   onMoveBlock={canReorderManually ? moveBlockRelativeTo : undefined}
+                                  dragEnabled={canReorderManually}
                                 />
                               ))}
                             </div>

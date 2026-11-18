@@ -3818,6 +3818,142 @@ class TestReorderEndpoint:
         assert item2.position == 1
 
 
+class TestMoveEndpoint:
+    """POST /queue/move renumbers the whole pending queue around the moved items.
+
+    The page used to number the rows it showed 1..n and post those. Rows
+    hidden by a filter kept their old numbers, so a job "moved to the top" of
+    one printer's view landed level with, or behind, jobs it never saw.
+    """
+
+    @pytest.fixture
+    async def make_items(self, db_session):
+        from backend.app.models.archive import PrintArchive
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.models.printer import Printer
+
+        async def _make(specs):
+            printers = {}
+            items = []
+            for n, (printer_key, status) in enumerate(specs, start=1):
+                printer_id = None
+                if printer_key is not None:
+                    if printer_key not in printers:
+                        printer = Printer(
+                            name=f"Move {printer_key}",
+                            ip_address=f"192.168.7.{len(printers) + 1}",
+                            serial_number=f"MOVE{printer_key}",
+                            access_code="12345678",
+                            model="X1C",
+                        )
+                        db_session.add(printer)
+                        await db_session.flush()
+                        printers[printer_key] = printer.id
+                    printer_id = printers[printer_key]
+                archive = PrintArchive(
+                    filename=f"move_{n}.3mf",
+                    print_name=f"Move {n}",
+                    file_path=f"/tmp/move_{n}.3mf",  # nosec B108
+                    file_size=1024,
+                    content_hash=f"movehash{n:06d}",
+                    status="completed",
+                )
+                db_session.add(archive)
+                await db_session.flush()
+                item = PrintQueueItem(printer_id=printer_id, archive_id=archive.id, status=status, position=n)
+                db_session.add(item)
+                items.append(item)
+            await db_session.commit()
+            return [item.id for item in items]
+
+        return _make
+
+    @staticmethod
+    async def _pending_order(db_session, contiguous=True):
+        from sqlalchemy import select
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        db_session.expire_all()
+        rows = await db_session.execute(
+            select(PrintQueueItem.id, PrintQueueItem.position)
+            .where(PrintQueueItem.status == "pending")
+            .order_by(PrintQueueItem.position, PrintQueueItem.id)
+        )
+        rows = rows.all()
+        if contiguous:
+            assert [p for _, p in rows] == list(range(1, len(rows) + 1)), "positions must be 1..n with no ties"
+        return [i for i, _ in rows]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_to_top_of_filtered_view_lands_at_top_of_queue(
+        self, async_client: AsyncClient, db_session, make_items
+    ):
+        # A, B on printer 1; C, D on printer 2. The user filters to printer 2
+        # and drags D above C.
+        a, b, c, d = await make_items([("p1", "pending"), ("p1", "pending"), ("p2", "pending"), ("p2", "pending")])
+
+        response = await async_client.post(
+            "/api/v1/queue/move", json={"item_ids": [d], "anchor_id": c, "place_after": False}
+        )
+        assert response.status_code == 200
+        # D moves directly before C; A and B, which the view never showed, keep their place.
+        assert await self._pending_order(db_session) == [a, b, d, c]
+
+        response = await async_client.post(
+            "/api/v1/queue/move", json={"item_ids": [d], "anchor_id": a, "place_after": False}
+        )
+        assert response.status_code == 200
+        assert await self._pending_order(db_session) == [d, a, b, c]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_block_keeps_its_queue_order_and_skips_finished_rows(
+        self, async_client: AsyncClient, db_session, make_items
+    ):
+        from backend.app.models.print_queue import PrintQueueItem
+
+        a, done, b, c, d = await make_items(
+            [(None, "pending"), (None, "completed"), (None, "pending"), (None, "pending"), (None, "pending")]
+        )
+
+        # Request order is D, B; queue order of the block is B, D.
+        response = await async_client.post(
+            "/api/v1/queue/move", json={"item_ids": [d, b], "anchor_id": c, "place_after": True}
+        )
+        assert response.status_code == 200
+        assert await self._pending_order(db_session) == [a, c, b, d]
+        done_row = await db_session.get(PrintQueueItem, done)
+        assert done_row.position == 2  # history rows are not renumbered
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_rejects_items_that_are_not_pending(self, async_client: AsyncClient, db_session, make_items):
+        a, printing, b = await make_items([("p1", "pending"), ("p1", "printing"), ("p1", "pending")])
+
+        response = await async_client.post(
+            "/api/v1/queue/move", json={"item_ids": [printing], "anchor_id": a, "place_after": False}
+        )
+        assert response.status_code == 409
+        response = await async_client.post(
+            "/api/v1/queue/move", json={"item_ids": [b], "anchor_id": printing, "place_after": False}
+        )
+        assert response.status_code == 409
+        # Nothing renumbered on a refused move.
+        assert await self._pending_order(db_session, contiguous=False) == [a, b]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_rejects_anchor_inside_the_moved_block(self, async_client: AsyncClient, make_items):
+        a, b = await make_items([(None, "pending"), (None, "pending")])
+
+        response = await async_client.post(
+            "/api/v1/queue/move", json={"item_ids": [a, b], "anchor_id": b, "place_after": False}
+        )
+        assert response.status_code == 422
+
+
 class TestForceColorOverridesAreScopedToThePlate:
     """Queueing several plates of one 3MF must not make each plate wait on the
     colours of its siblings (#2551).
