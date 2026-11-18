@@ -2349,7 +2349,34 @@ class PrintScheduler:
                     if not printer_connected:
                         plugs = await self._get_smart_plugs(db, item.printer_id)
                         auto_on_plugs = self._auto_on_plugs(plugs)
+                        # A power-on blocks this whole pass for up to
+                        # `_power_on_wait_time`, so the rules the model branch
+                        # follows apply here too (#2786): one power-on per pass,
+                        # and a printer that did not come up waits out its
+                        # cool-off. Without them, one printer that never answers
+                        # cost every pass three minutes, and every other printer's
+                        # jobs, scheduled ones included, started that much later.
+                        if auto_on_plugs and self._wake_recently_failed(item.printer_id):
+                            await hold_for_printer(
+                                item,
+                                item.printer_id,
+                                "smart-plug power-on failed recently; cooling off",
+                                f"Offline: {printer_label(item.printer_id)} — the smart plug could not power it on",
+                            )
+                            continue
+                        if auto_on_plugs and power_on_attempted:
+                            # Busy-shaped, like drying: it is its turn that it waits
+                            # for, and a reason that asked for something here would
+                            # swallow the notification if the power-on then fails.
+                            await hold_for_printer(
+                                item,
+                                item.printer_id,
+                                "offline; another printer is being powered on this pass",
+                                f"Busy: {printer_label(item.printer_id)} (offline, powered on next)",
+                            )
+                            continue
                         if auto_on_plugs:
+                            power_on_attempted = True
                             logger.info("Printer %s offline, attempting to power on via smart plug(s)", item.printer_id)
                             # Power on using the plug that actually feeds the printer, and
                             # wait for it to boot on that one only (#2629).
@@ -2376,7 +2403,12 @@ class PrintScheduler:
                                 printer_connected = True
                                 printer_idle = self._is_printer_idle(item.printer_id, require_plate_clear)
                             else:
-                                logger.warning("Could not power on printer %s via smart plug", item.printer_id)
+                                logger.warning(
+                                    "Could not power on printer %s via smart plug; not trying it again for %ss",
+                                    item.printer_id,
+                                    self._wake_failure_cooloff,
+                                )
+                                self._wake_failures[item.printer_id] = time.monotonic() + self._wake_failure_cooloff
                                 await hold_for_printer(
                                     item,
                                     item.printer_id,
