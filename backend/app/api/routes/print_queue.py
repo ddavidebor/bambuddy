@@ -61,6 +61,7 @@ from backend.app.schemas.print_queue import (
     PrintQueueItemCreate,
     PrintQueueItemResponse,
     PrintQueueItemUpdate,
+    PrintQueueMove,
     PrintQueueReorder,
     QueueVariantCreate,
     QueueVariantSummary,
@@ -80,7 +81,7 @@ from backend.app.services.print_batch import (
 from backend.app.services.print_cost_estimate import estimate_queue_source_cost
 from backend.app.services.queue_announcements import announce_queue_jobs_added
 from backend.app.services.queue_item_printer import PRINTER_RESOLVED_DEFAULTS, drop_printer_resolved
-from backend.app.services.queue_position import lock_queue_positions, max_queue_position
+from backend.app.services.queue_position import lock_queue_positions, max_queue_position, move_queue_items
 from backend.app.utils.printer_models import (
     is_gcode_compatible,
 )
@@ -2795,6 +2796,47 @@ async def reorder_queue(
     await db.commit()
     logger.info("Reordered %s queue items", len(data.items))
     return {"message": f"Reordered {len(data.items)} items"}
+
+
+@router.post("/move")
+async def move_queue_items_route(
+    data: PrintQueueMove,
+    db: AsyncSession = Depends(get_db, scope="function"),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_UPDATE_ALL),
+    printer_scope: PrinterScope = RequestPrinterScope,
+):
+    """Move pending items before or after another pending item.
+
+    Renumbers the whole pending queue, including items the caller cannot see,
+    so their order relative to each other is kept and no two items share a
+    position.
+    """
+    await lock_queue_positions(db)
+    pending = list(
+        (
+            await db.execute(
+                select(PrintQueueItem)
+                .where(PrintQueueItem.status == "pending")
+                .order_by(PrintQueueItem.position, PrintQueueItem.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    visible = {item.id for item in pending if printer_scope.allows(item.printer_id)}
+    missing = [i for i in [*data.item_ids, data.anchor_id] if i not in visible]
+    if missing:
+        raise HTTPException(409, f"Not pending, or not in the queue: {missing}")
+
+    await move_queue_items(db, pending, data.item_ids, data.anchor_id, data.place_after)
+    await db.commit()
+    logger.info(
+        "Moved queue items %s %s item %s",
+        data.item_ids,
+        "after" if data.place_after else "before",
+        data.anchor_id,
+    )
+    return {"message": f"Moved {len(data.item_ids)} items"}
 
 
 @router.post("/printer/{printer_id}/resume")

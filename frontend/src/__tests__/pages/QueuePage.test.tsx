@@ -163,7 +163,7 @@ describe('QueuePage', () => {
       http.post('/api/v1/queue/:id/stop', () => {
         return HttpResponse.json({ success: true });
       }),
-      http.post('/api/v1/queue/reorder', () => {
+      http.post('/api/v1/queue/move', () => {
         return HttpResponse.json({ success: true });
       })
     );
@@ -2028,7 +2028,7 @@ describe('QueuePage', () => {
   });
 
   // #2667: mobile can't drag-reorder the queue, so pending rows get up/down
-  // arrows. They persist via the same POST /queue/reorder as drag. The
+  // arrows. They persist via the same POST /queue/move as drag. The
   // buttons live in the DOM at every width (Tailwind `sm:hidden` is CSS-only),
   // so they're clickable in jsdom.
   describe('mobile reorder arrows (#2667)', () => {
@@ -2052,12 +2052,12 @@ describe('QueuePage', () => {
       expect(screen.getAllByTitle('Move Down')).toHaveLength(3);
     });
 
-    it('moving the first item down persists the swapped order', async () => {
-      let reorderBody: { items: { id: number; position: number }[] } | null = null;
+    it('moving the first item down asks the server to put it after the next one', async () => {
+      let moveBody: { item_ids: number[]; anchor_id: number; place_after: boolean } | null = null;
       server.use(
         http.get('/api/v1/queue/', () => HttpResponse.json(threePending)),
-        http.post('/api/v1/queue/reorder', async ({ request }) => {
-          reorderBody = (await request.json()) as typeof reorderBody;
+        http.post('/api/v1/queue/move', async ({ request }) => {
+          moveBody = (await request.json()) as typeof moveBody;
           return HttpResponse.json({ message: 'ok' });
         }),
       );
@@ -2065,15 +2065,27 @@ describe('QueuePage', () => {
 
       await waitFor(() => expect(screen.getByText('Pending 1')).toBeInTheDocument());
 
-      // First row's "Move Down": item 1 drops below item 2 → [2, 1, 3].
+      // First row's "Move Down": item 1 goes after item 2. The server
+      // renumbers, so rows this page cannot see keep their place.
       await userEvent.click(screen.getAllByTitle('Move Down')[0]);
 
-      await waitFor(() => expect(reorderBody).not.toBeNull());
-      expect(reorderBody!.items).toEqual([
-        { id: 2, position: 1 },
-        { id: 1, position: 2 },
-        { id: 3, position: 3 },
-      ]);
+      await waitFor(() => expect(moveBody).not.toBeNull());
+      expect(moveBody).toEqual({ item_ids: [1], anchor_id: 2, place_after: true });
+    });
+
+    it('offers no reordering while the list is sorted by something else', async () => {
+      // A drag there used to save the name (or time) order as the queue order.
+      server.use(http.get('/api/v1/queue/', () => HttpResponse.json(threePending)));
+      const user = userEvent.setup();
+      render(<QueuePage />);
+
+      await waitFor(() => expect(screen.getByText('Pending 1')).toBeInTheDocument());
+      expect(screen.getByText('Drag to reorder (ASAP only)')).toBeInTheDocument();
+
+      await user.selectOptions(screen.getByDisplayValue('Sort by Position'), 'name');
+
+      expect(screen.queryByText('Drag to reorder (ASAP only)')).not.toBeInTheDocument();
+      expect(screen.queryAllByTitle('Move Up')).toHaveLength(0);
     });
 
     it('disables Move Up on the first row and Move Down on the last', async () => {

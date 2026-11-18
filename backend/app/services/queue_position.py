@@ -43,3 +43,22 @@ async def next_queue_position(db: AsyncSession) -> int:
     """Position for an item appended to the end of the queue, under the lock."""
     await lock_queue_positions(db)
     return await max_queue_position(db) + 1
+
+
+async def move_queue_items(
+    db: AsyncSession, pending: list[PrintQueueItem], item_ids: list[int], anchor_id: int, place_after: bool
+) -> None:
+    """Move *item_ids* next to *anchor_id* and renumber every pending item 1..n.
+
+    *pending* is the whole pending queue in its current order, read under
+    ``lock_queue_positions``. The moved items keep their relative order. Only
+    rows whose position changes are written. The caller commits.
+    """
+    moving = set(item_ids)
+    remaining = [item for item in pending if item.id not in moving]
+    insert_at = next(i for i, item in enumerate(remaining) if item.id == anchor_id) + (1 if place_after else 0)
+    # Moved items keep the order they had in the queue, not the request's.
+    moved = [item for item in pending if item.id in moving]
+    for position, item in enumerate(remaining[:insert_at] + moved + remaining[insert_at:], start=1):
+        if item.position != position:
+            item.position = position

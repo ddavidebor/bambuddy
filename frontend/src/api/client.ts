@@ -7011,6 +7011,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ items }),
     }),
+  // Move pending items next to another one; the server renumbers the queue.
+  moveQueueItems: (itemIds: number[], anchorId: number, placeAfter: boolean) =>
+    request<{ message: string }>('/queue/move', {
+      method: 'POST',
+      body: JSON.stringify({ item_ids: itemIds, anchor_id: anchorId, place_after: placeAfter }),
+    }),
   cancelQueueItem: (id: number) =>
     request<{ message: string }>(`/queue/${id}/cancel`, { method: 'POST' }),
   stopQueueItem: (id: number) =>

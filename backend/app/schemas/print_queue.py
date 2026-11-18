@@ -381,6 +381,28 @@ class PrintQueueReorder(BaseModel):
         return self
 
 
+class PrintQueueMove(BaseModel):
+    """Move pending items to sit before or after another pending item.
+
+    The queue page's drag and its up/down arrows send this rather than
+    positions: the page only sees the items its filters and the caller's scope
+    let through, so positions it numbered itself collided with the ones it
+    could not see. The server renumbers the whole pending queue instead.
+    """
+
+    item_ids: list[int] = Field(min_length=1)
+    anchor_id: int
+    place_after: bool = False
+
+    @model_validator(mode="after")
+    def _validate_ids(self) -> "PrintQueueMove":
+        if len(self.item_ids) != len(set(self.item_ids)):
+            raise ValueError("Duplicate item ids in move request")
+        if self.anchor_id in self.item_ids:
+            raise ValueError("The anchor item cannot be one of the items being moved")
+        return self
+
+
 class PrintQueueBulkUpdate(IgnoresNullForRequiredColumns):
     """Bulk update multiple queue items with the same values."""
 
