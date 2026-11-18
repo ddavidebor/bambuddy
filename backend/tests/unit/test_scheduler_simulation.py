@@ -267,7 +267,7 @@ class _Sim:
     async def between_passes(self, db) -> None:
         rng = self.rng
         self.clock.advance(rng.choice([30, 60, 120, 300, 900]))
-        for pid, p in self.printers.items():
+        for p in self.printers.values():
             if p.busy_until and p.busy_until <= self.clock.now:
                 if p.job is not None:
                     item = await db.get(PrintQueueItem, p.job)
